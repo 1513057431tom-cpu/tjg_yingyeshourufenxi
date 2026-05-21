@@ -1,0 +1,62 @@
+-- 让 public.mis_auto_puyao_jyycmx 兼容普药提供的两个过程：
+-- 1. Cost_Data_Cost_Sales_Nospecialty_JJRC
+-- 2. Cost_Data_Cost_Sales_Nospecialty_Drugs_JYYC_levels3
+--
+-- 当前库里 public.mis_auto_puyao_jyycmx 是空表；若后续已有数据，执行类型转换前需要先清理非数字文本。
+
+ALTER TABLE public.mis_auto_puyao_jyycmx
+    ADD COLUMN IF NOT EXISTS id integer,
+    ADD COLUMN IF NOT EXISTS orderno varchar,
+    ADD COLUMN IF NOT EXISTS fapiaoqijian varchar,
+    ADD COLUMN IF NOT EXISTS csaleinvoicecode varchar,
+    ADD COLUMN IF NOT EXISTS cinvoicecustid varchar,
+    ADD COLUMN IF NOT EXISTS firstvbillcode varchar,
+    ADD COLUMN IF NOT EXISTS cmaterialvid varchar,
+    ADD COLUMN IF NOT EXISTS rowpknum integer,
+    ADD COLUMN IF NOT EXISTS status tinyint,
+    ADD COLUMN IF NOT EXISTS companyid integer,
+    ADD COLUMN IF NOT EXISTS createid integer,
+    ADD COLUMN IF NOT EXISTS allnode varchar,
+    ADD COLUMN IF NOT EXISTS createtime integer,
+    ADD COLUMN IF NOT EXISTS isVoid tinyint,
+    ADD COLUMN IF NOT EXISTS dingdanchongdijine numeric(24,8),
+    ADD COLUMN IF NOT EXISTS dingdanshuliang numeric(24,8),
+    ADD COLUMN IF NOT EXISTS fpwlhzchongdijine numeric(24,8),
+    ADD COLUMN IF NOT EXISTS fpwlhzshuliang numeric(24,8),
+    ADD COLUMN IF NOT EXISTS dangqipiaozhefentand numeric(24,8),
+    ADD COLUMN IF NOT EXISTS fdq_ftamount varchar,
+    ADD COLUMN IF NOT EXISTS fdq_ftnum varchar,
+    ADD COLUMN IF NOT EXISTS fdqb_ftamount varchar,
+    ADD COLUMN IF NOT EXISTS fdqb_ftnum varchar;
+
+ALTER TABLE public.mis_auto_puyao_jyycmx
+    ALTER COLUMN srcid TYPE integer USING NULLIF(srcid, '')::integer,
+    ALTER COLUMN nnum TYPE numeric(24,8) USING NULLIF(nnum, '')::numeric(24,8),
+    ALTER COLUMN quantity TYPE numeric(24,8) USING NULLIF(quantity, '')::numeric(24,8),
+    ALTER COLUMN norigtaxprice1 TYPE numeric(24,8) USING NULLIF(norigtaxprice1, '')::numeric(24,8),
+    ALTER COLUMN norigtaxnetprice TYPE numeric(24,8) USING NULLIF(norigtaxnetprice, '')::numeric(24,8),
+    ALTER COLUMN norigmny1 TYPE numeric(24,8) USING NULLIF(norigmny1, '')::numeric(24,8),
+    ALTER COLUMN ntotalincomemny TYPE numeric(24,8) USING NULLIF(ntotalincomemny, '')::numeric(24,8),
+    ALTER COLUMN norigsubmny1 TYPE numeric(24,8) USING NULLIF(norigsubmny1, '')::numeric(24,8),
+    ALTER COLUMN ntotalincomemny1 TYPE numeric(24,8) USING NULLIF(ntotalincomemny1, '')::numeric(24,8),
+    ALTER COLUMN norigdiscount1 TYPE numeric(24,8) USING NULLIF(norigdiscount1, '')::numeric(24,8),
+    ALTER COLUMN cdq_je_bhs TYPE numeric(24,8) USING NULLIF(cdq_je_bhs, '')::numeric(24,8),
+    ALTER COLUMN unitbaseprice TYPE numeric(24,8) USING NULLIF(unitbaseprice, '')::numeric(24,8),
+    ALTER COLUMN minimumpriceamount TYPE numeric(24,8) USING NULLIF(minimumpriceamount, '')::numeric(24,8),
+    ALTER COLUMN dq_pz TYPE numeric(24,8) USING NULLIF(dq_pz, '')::numeric(24,8),
+    ALTER COLUMN dq_pz_bhs TYPE numeric(24,8) USING NULLIF(dq_pz_bhs, '')::numeric(24,8),
+    ALTER COLUMN sw_lpz_sr TYPE numeric(24,8) USING NULLIF(sw_lpz_sr, '')::numeric(24,8),
+    ALTER COLUMN lpz_sr_hj TYPE numeric(24,8) USING NULLIF(lpz_sr_hj, '')::numeric(24,8),
+    ALTER COLUMN sw_lpz_sr_hj TYPE numeric(24,8) USING NULLIF(sw_lpz_sr_hj, '')::numeric(24,8),
+    ALTER COLUMN js_lpz_fy TYPE numeric(24,8) USING NULLIF(js_lpz_fy, '')::numeric(24,8),
+    ALTER COLUMN zs_lpz_fy TYPE numeric(24,8) USING NULLIF(zs_lpz_fy, '')::numeric(24,8),
+    ALTER COLUMN bhdq_pz_cdq_bhs TYPE numeric(24,8) USING NULLIF(bhdq_pz_cdq_bhs, '')::numeric(24,8),
+    ALTER COLUMN fdq_pz TYPE numeric(24,8) USING NULLIF(fdq_pz, '')::numeric(24,8),
+    ALTER COLUMN fdq_pz_bcdq TYPE numeric(24,8) USING NULLIF(fdq_pz_bcdq, '')::numeric(24,8),
+    ALTER COLUMN fdq_pz_jt TYPE numeric(24,8) USING NULLIF(fdq_pz_jt, '')::numeric(24,8),
+    ALTER COLUMN fdq_pz_bcdq_jt TYPE numeric(24,8) USING NULLIF(fdq_pz_bcdq_jt, '')::numeric(24,8),
+    ALTER COLUMN fdq_pz_hj TYPE numeric(24,8) USING NULLIF(fdq_pz_hj, '')::numeric(24,8),
+    ALTER COLUMN fdq_pz_bcdq_hj TYPE numeric(24,8) USING NULLIF(fdq_pz_bcdq_hj, '')::numeric(24,8),
+    ALTER COLUMN fdq_pz_bcdq_bhs TYPE numeric(24,8) USING NULLIF(fdq_pz_bcdq_bhs, '')::numeric(24,8),
+    ALTER COLUMN fdq_pz_bhs TYPE numeric(24,8) USING NULLIF(fdq_pz_bhs, '')::numeric(24,8),
+    ALTER COLUMN pz_hj TYPE numeric(24,8) USING NULLIF(pz_hj, '')::numeric(24,8);

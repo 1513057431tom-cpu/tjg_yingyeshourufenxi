@@ -1,0 +1,687 @@
+CREATE OR REPLACE PROCEDURE "public"."Cost_Data_Cost_Sales_CoreDrug_GGYAO"(IN "s_cperiod" varchar, INOUT "result" int4, INOUT "msg" text)
+ AS $BODY$
+
+DECLARE
+    done        INT DEFAULT 0;
+    v_pk_accasoa TEXT;
+    v_disname    TEXT;
+    v_fieldname  TEXT;
+    -- 接收子过程返回码&信息
+    v_sub_result INT4;
+    v_sub_msg    TEXT;
+    v_jisuanliangpiaozhifeiyong DECIMAL(20,8) DEFAULT 0;
+    v_cresum DECIMAL(20,8) DEFAULT 0;
+    v_dijiashouru_087115  DECIMAL(20,8) DEFAULT 0;
+    v_localdebitamount1  DECIMAL(20,8) DEFAULT 0;
+    v_localdebitamount2  DECIMAL(20,8) DEFAULT 0;
+    v_wushuijineheji DECIMAL(20,8) DEFAULT 0;
+    v_sum_dj DECIMAL(20,8) DEFAULT 0;
+    v_sum_xinte DECIMAL(20,8) DEFAULT 0;
+    v_sum_other DECIMAL(20,8) DEFAULT 0;
+    v_shuijinjifujia DECIMAL(20,8) DEFAULT 0;
+    v_guanlifeiyong DECIMAL(20,8) DEFAULT 0;
+    v_yanfafeiyong DECIMAL(20,8) DEFAULT 0;
+    v_caiwufeiyong DECIMAL(20,8) DEFAULT 0;
+    v_localdebitamount DECIMAL(20,8) DEFAULT 0;
+    vv_cresum DECIMAL(20,8) DEFAULT 0;
+    v_total_amount DECIMAL(20,8) DEFAULT 0;
+    v_year int;
+    v_upmonth varchar(50);
+	  
+BEGIN
+
+  v_year:=left(s_cperiod, 4);
+  --v_upmonth :=CASE WHEN RIGHT(s_cperiod,2)='01' THEN s_cperiod ELSE TO_CHAR(TO_DATE(s_cperiod,'YYYY-MM') - INTERVAL '1 month','YYYY-MM') END;
+  
+  -- 在INSERT之前先删除目标期间的数据,避免重复
+  DELETE FROM mis_auto_hlutv WHERE cperiod = s_cperiod;
+  
+  -- 插入销售发票执行-骨干品种药基础数据
+  INSERT INTO mis_auto_hlutv (
+        icperiodst,shujuqijian,cperiod,saleID,jinshuipiaohao,jinshuikaipiaoriqi,csaleinvoiceid,shijichukuriqi,kaipiaokehu,xiaoshoubumen,xiaoshouyewuyuan,
+        xiaoshouqudao,qudaoyewuyuan,diqufenlei,shengshiqu,pingzhenghao,yetai,pinzhongleixing,
+        wuliaobianma,wuliaomingcheng,guige,xinguige,zhushuliang,jianshu,zhuhanshuidanjia,
+        zhuhanshuijingjia,wushuijineheji,jiashuiheji,feiyongchongdijine,zhekoue,allnode,createtime,cmaterialvid
+    )
+  SELECT
+        case when mis_auto_ptpcr.cperiod=s_cperiod then 1 else 0 end as icperiodst,
+        mis_auto_ptpcr.cperiod as shujuqijian,
+        s_cperiod AS cperiod,
+        mis_auto_ptpcr.id AS saleID,
+        mis_auto_ptpcr.vdef__1 AS jinshuipiaohao,             
+        mis_auto_ptpcr.vdef__2 AS jinshuikaipiaoriqi,
+        mis_auto_ptpcr.cbillid AS csaleinvoiceid,		
+        mis_auto_ptpcr.vdef__3 AS shijichukuriqi,         
+        mis_auto_ptpcr.name_2 AS kaipiaokehu,              
+        mis_auto_ptpcr.name_5 AS xiaoshoubumen,              
+        mis_auto_ptpcr.name_6 AS xiaoshouyewuyuan,            
+        mis_auto_ptpcr.sales_channel AS xiaoshouqudao,       
+        mis_auto_ptpcr.sales_channel AS qudaoyewuyuan,      
+        mis_auto_ptpcr.area_class AS diqufenlei,          
+        mis_auto_rthzk_sub_duizhaomingxi.shengfen AS shengshiqu,         
+        mis_auto_ptpcr.num AS pingzhenghao,                  
+        mis_auto_ptpcr.vdef__5 AS yetai,                
+        '骨干' AS pinzhongleixing, 
+        mis_auto_ptpcr.material_code AS wuliaobianma, 
+        mis_auto_ptpcr.material_name AS wuliaomingcheng, 
+        mis_auto_ptpcr.material_spec AS guige,    		
+		CAST(
+		  CONCAT(
+			'H1-',
+			-- 精准匹配「数字+支」,只取数字
+			(regexp_match(mis_auto_ptpcr.material_spec, '(\d+)支'))[1]
+		  )
+		AS VARCHAR
+		) AS xinguige,
+        mis_auto_ptpcr.nnum AS zhushuliang,  
+        mis_auto_ptpcr.nnum / mis_auto_tbdua.measrate AS jianshu, 
+        mis_auto_ptpcr.norigtaxprice1 AS zhuhanshuidanjia,   
+        mis_auto_ptpcr.norigtaxnetprice AS zhuhanshuijingjia, 
+        mis_auto_ptpcr.norigmny1 AS wushuijineheji,    
+        mis_auto_ptpcr.norigtaxmny AS jiashuiheji,
+		mis_auto_ptpcr.norigsubmny1 AS feiyongchongdijine,		
+        mis_auto_ptpcr.norigdiscount1 AS zhekoue,
+		'MisAutoTye' as allnode,
+        extract(epoch FROM now()) as createtime,
+        mis_auto_ptpcr.cmaterialvid
+		
+    FROM mis_auto_ptpcr
+		-- 关联物料视图
+        INNER JOIN bd_material_v ON bd_material_v.pk_material = mis_auto_ptpcr.cmaterialvid	
+        -- 关联骨干品种清单	
+		INNER JOIN 
+    
+    (SELECT masid,cinvcode FROM mis_auto_niyzt_sub_dijiamingxi WHERE isVoid = 'f' GROUP BY masid,cinvcode) mis_auto_niyzt_sub_dijiamingxi 
+			ON bd_material_v.code = mis_auto_niyzt_sub_dijiamingxi.cinvcode
+		INNER JOIN mis_auto_niyzt ON mis_auto_niyzt.id = mis_auto_niyzt_sub_dijiamingxi.masid 
+			AND mis_auto_niyzt.status = 1 
+			AND mis_auto_niyzt.isVoid = 0 
+			AND LEFT(mis_auto_niyzt.cperiod, 4) = LEFT(s_cperiod, 4)  -- 同年
+			AND mis_auto_niyzt.cperiod >= s_cperiod    -- 大于等于当前月
+      
+		-- 关联骨干省市区对照表				
+		INNER JOIN mis_auto_rthzk_sub_duizhaomingxi 
+		  ON (
+			(mis_auto_rthzk_sub_duizhaomingxi.xiaoshoubumen = mis_auto_ptpcr.name_5) 
+			OR (mis_auto_ptpcr.name_5 IS NULL AND mis_auto_rthzk_sub_duizhaomingxi.xiaoshoubumen IS NULL)
+		  )
+		  AND mis_auto_rthzk_sub_duizhaomingxi.kaipiaokehu = mis_auto_ptpcr.name_2 
+		  AND mis_auto_rthzk_sub_duizhaomingxi.isVoid = 'f'
+
+		INNER JOIN mis_auto_rthzk ON mis_auto_rthzk.id = mis_auto_rthzk_sub_duizhaomingxi.masid 
+			AND LEFT(mis_auto_rthzk.cperiod, 4) = LEFT(s_cperiod, 4)  
+			AND mis_auto_rthzk.cperiod >= s_cperiod 
+			AND mis_auto_rthzk.status = 1 
+			AND mis_auto_rthzk.isVoid = 0			
+        -- 关联辅计量管理表
+        LEFT JOIN mis_auto_tbdua ON mis_auto_ptpcr.cmaterialvid = mis_auto_tbdua.pk_material 	 
+        WHERE mis_auto_ptpcr.cperiod <= s_cperiod and left(mis_auto_ptpcr.cperiod,4)>=v_year
+            AND mis_auto_niyzt.status=1 
+            AND mis_auto_niyzt.isVoid = 0
+		GROUP BY mis_auto_ptpcr.id;
+	
+  RAISE NOTICE '第一个 入库节点 %',NOW();     
+  -- 动态计算底价金额=价税合计、底价收入=无税金额合计、高开收入
+  IF 11=11 THEN
+    BEGIN
+	
+		-- 冲抵前金额
+		UPDATE mis_auto_hlutv SET chongdiqianjine = COALESCE(jiashuiheji, 0) + COALESCE(feiyongchongdijine, 0) WHERE cperiod = s_cperiod;
+	
+	/*
+      1、川渝地区(省市区是四川省、重庆市)：底价金额=价税合计、底价收入=无税金额合计、不计算高开收入；																																			  
+      5、地区是广东省的且规格是6支装的：单位底价是8.5,底价金额=主数量*单位底价、底价收入=底价金额/1.13、高开收入=无税金额合计-底价收入
+    */ 
+	
+    WITH b_values AS (
+      select 
+        mis_auto_hlutv.id,
+        mis_auto_hlutv.jiashuiheji,
+        ifnull(t2.danweidijia,0) as danweidijia,
+        calculate_formula(t2.dijiajine,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as dijiajine,
+        calculate_formula(t2.dijiashouru,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as      dijiashouru,
+        calculate_formula(t2.gaokaishouru,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as gaokaishouru
+      from mis_auto_hlutv
+      inner join mis_auto_goppm_sub_quyupeizhi t2 
+        on t2.quyu = mis_auto_hlutv.shengshiqu
+      where 1=1 
+      AND mis_auto_hlutv.cperiod=s_cperiod	 
+	  
+	   AND NOT (
+		LEFT(s_cperiod, 4) = '2026'
+		AND t2.quyu IS NOT NULL AND t2.quyu <> ''
+		AND t2.guige IS NOT NULL AND t2.guige <> ''
+		AND mis_auto_hlutv.shengshiqu = t2.quyu
+		AND substring(mis_auto_hlutv.guige from '([0-9]+支)') = t2.guige
+	)		
+ 
+      and case 
+            WHEN ifnull(t2.guige,'') <> '' 
+            THEN substring(mis_auto_hlutv.guige from '([0-9]+支)') = t2.guige				  
+            --THEN mis_auto_hlutv.guige LIKE '%' || t2.guige || '%'  --- 这里动态匹配 t2.guige
+            ELSE true 
+          END
+     )
+     UPDATE mis_auto_hlutv 
+        SET dijiashouru = b_values.dijiashouru,
+			danweidijia = b_values.danweidijia,
+            dijiajine = b_values.dijiajine,  -- 直接赋值
+            gaokaishouru = b_values.gaokaishouru,
+            istatus=1
+        FROM b_values 
+        WHERE mis_auto_hlutv.id = b_values.id;
+    
+    /*
+      主含税单价+规格匹配
+      2、规格是6支装且主含税单价是25.3的：底价金额=价税合计、底价收入=无税金额合计、不计算高开收入；
+    */
+    WITH b2_values AS (
+      select 
+        mis_auto_hlutv.id,
+        mis_auto_hlutv.jiashuiheji,
+        calculate_formula(t2.dijiajine,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as dijiajine,
+        calculate_formula(t2.dijiashouru,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as dijiashouru,
+        calculate_formula(t2.gaokaishouru,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as gaokaishouru
+      from mis_auto_hlutv
+      inner join mis_auto_goppm_sub_guigepeizhi t2 on mis_auto_hlutv.zhuhanshuidanjia=t2.zhuhanshuidanjia
+      where 1=1 and ifnull(t2.guige,'')<>'' 
+      AND mis_auto_hlutv.cperiod=s_cperiod
+      and  mis_auto_hlutv.guige LIKE '%' || ifnull(t2.guige,'@#@#@#') || '%'
+     )
+     UPDATE mis_auto_hlutv 
+        SET dijiashouru = b2_values.dijiashouru,
+            dijiajine = b2_values.jiashuiheji,
+            gaokaishouru = b2_values.gaokaishouru,
+            istatus=1
+        FROM b2_values 
+        WHERE mis_auto_hlutv.id = b2_values.id and ifnull(mis_auto_hlutv.istatus,0)<>1;
+
+    /*
+      部门配置
+      3、销售部门是供应链管理组、供应链组的：底价金额=价税合计、底价收入=无税金额合计、不计算高开收入；
+    */
+    WITH b3_values AS (
+      select 
+        mis_auto_hlutv.id,
+		mis_auto_hlutv.jiashuiheji,
+        calculate_formula(t2.dijiajine,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as dijiajine,
+        calculate_formula(t2.dijiashouru,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as dijiashouru,
+        calculate_formula(t2.gaokaishouru,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as gaokaishouru
+      from mis_auto_hlutv
+      inner join mis_auto_goppm_sub_bumenpeizhi t2  on mis_auto_hlutv.xiaoshoubumen=t2.bumen
+      where 1=1
+      AND mis_auto_hlutv.cperiod=s_cperiod
+     )
+     UPDATE mis_auto_hlutv 
+        SET dijiashouru = b3_values.dijiashouru,
+            dijiajine = b3_values.jiashuiheji,
+            gaokaishouru = b3_values.gaokaishouru,
+            istatus=1
+        FROM b3_values 
+        WHERE mis_auto_hlutv.id = b3_values.id and ifnull(mis_auto_hlutv.istatus,0)<>1;
+    
+    /*
+      客户配置 
+      4、开票客户是上海九州通医药有限公司和漱玉医药物流(山东)有限公司的：底价金额=价税合计、底价收入=无税金额合计、不计算高开收入；
+	  6、开票客户是重庆今瑜医药股份有限公司(且川渝地区)的：底价金额=价税合计、底价收入=无税金额合计、不计算高开收入；
+    */
+    WITH b4_values AS (
+	  select 
+		mis_auto_hlutv.id,
+        mis_auto_hlutv.jiashuiheji,
+        calculate_formula(t2.dijiajine,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as dijiajine,
+        calculate_formula(t2.dijiashouru,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as dijiashouru,
+        calculate_formula(t2.gaokaishouru,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as gaokaishouru
+      from mis_auto_hlutv
+	  inner join mis_auto_goppm_sub_kehupeizhi t2  on mis_auto_hlutv.kaipiaokehu=t2.kehu
+
+	  where mis_auto_hlutv.cperiod = s_cperiod
+	  and case  WHEN ifnull(t2.guige,'') <> '' THEN  mis_auto_hlutv.guige = t2.guige	ELSE true  END
+	  and (
+		-- 2025年：所有客户都生效
+		  s_cperiod LIKE '2025%'
+		or
+		-- 2026年+：所有客户都生效(客户+地区匹配)
+		(
+		  s_cperiod >= '2026-01'
+		  and (
+			t2.quyu is null or t2.quyu = ''
+			or 
+			position( concat(',', mis_auto_hlutv.shengshiqu, ',') in concat(',', t2.quyu, ',') ) > 0
+				)
+		)
+			)
+	)
+	UPDATE mis_auto_hlutv 
+	SET 
+	  dijiashouru = b4_values.dijiashouru,
+	  dijiajine = b4_values.dijiajine,
+	  gaokaishouru = b4_values.gaokaishouru,
+	  istatus=1
+	FROM b4_values 
+	WHERE mis_auto_hlutv.id = b4_values.id and ifnull(mis_auto_hlutv.istatus,0)<>1;
+   
+    /*
+      最后规则,匹配
+      7、开票客户是重庆今瑜医药股份有限公司且非川渝地区的：根据8、特殊情况来,底价金额=主数量*单位底价、底价收入=底价金额/1.13、高开收入=无税金额合计-底价收入；
+    */
+      WITH b5_values AS (
+        SELECT * 
+        FROM mis_auto_goppm_sub_zuixinguize g 
+        -- WHERE g.kaiqiqijian <= s_cperiod AND g.jieshuqijian >= s_cperiod
+      ),
+      b6_values AS (
+       SELECT
+          h.id,
+          h.guige,
+          g.guige AS gg,
+		  h.jiashuiheji,
+          -- g.danweidijia,
+          calculate_formula(g.danweidijia,'zhuhanshuijingjia,zhushuliang,jiashuiheji,wushuijineheji',concat(zhuhanshuijingjia,',',zhushuliang,',',h.jiashuiheji,',',h.wushuijineheji)) as danweidijia,
+          calculate_formula(g.dijiajine,'zhuhanshuijingjia,zhushuliang,jiashuiheji,wushuijineheji',concat(zhuhanshuijingjia,',',zhushuliang,',',h.jiashuiheji,',',h.wushuijineheji)) as dijiajine,
+          calculate_formula(g.dijiashouru,'zhuhanshuijingjia,zhushuliang,jiashuiheji,wushuijineheji',concat(zhuhanshuijingjia,',',zhushuliang,',',h.jiashuiheji,',',h.wushuijineheji)) as dijiashouru,
+          calculate_formula(g.gaokaishouru,'zhuhanshuijingjia,zhushuliang,jiashuiheji,wushuijineheji',concat(zhuhanshuijingjia,',',zhushuliang,',',h.jiashuiheji,',',h.wushuijineheji)) as gaokaishouru,
+          -- 提取主表规格里的【数字支】,例如 18支
+          substring(h.guige from '([0-9]+支)') AS main_zhishu
+        FROM mis_auto_hlutv h
+        INNER JOIN b5_values g
+          ON h.shujuqijian >= g.kaiqiqijian 
+          AND h.shujuqijian <= g.jieshuqijian
+          AND h.cperiod = s_cperiod
+      )
+		  
+     UPDATE mis_auto_hlutv 
+        SET dijiashouru = t_b6_values.dijiashouru,
+            dijiajine = t_b6_values.dijiajine,
+            gaokaishouru = t_b6_values.gaokaishouru,
+            danweidijia = t_b6_values.danweidijia,
+            istatus=2
+        FROM (select * from b6_values where gg=main_zhishu) t_b6_values
+        WHERE mis_auto_hlutv.id = t_b6_values.id
+		and ifnull(mis_auto_hlutv.istatus,0)<>1;
+		
+	/**
+      直接根据物料信息设置规则底价金额=价税合计、底价收入=无税金额合计、不计算高开收入；				
+    */
+    WITH b_values9 AS (
+      select 
+        mis_auto_hlutv.id,
+		mis_auto_hlutv.jiashuiheji,
+		ifnull(t2.danweidijia,0) as danweidijia,
+        calculate_formula(t2.dijiajine,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as dijiajine,
+        calculate_formula(t2.dijiashouru,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as dijiashouru,
+        calculate_formula(t2.gaokaishouru,'zhushuliang,jiashuiheji,wushuijineheji',concat(zhushuliang,',',mis_auto_hlutv.jiashuiheji,',',mis_auto_hlutv.wushuijineheji)) as gaokaishouru
+      from mis_auto_hlutv
+      inner join mis_auto_goppm_sub_wuliaopeizhi t2 
+        on t2.wuliaobianma = mis_auto_hlutv.wuliaobianma
+      where 1=1 
+      AND mis_auto_hlutv.cperiod = s_cperiod
+	  AND mis_auto_hlutv.cperiod >= '2026-01'
+     )
+     UPDATE mis_auto_hlutv 
+        SET dijiashouru = b_values9.dijiashouru,
+            danweidijia = b_values9.danweidijia,
+            dijiajine = b_values9.dijiajine,  -- 直接赋值
+            gaokaishouru = b_values9.gaokaishouru,
+            istatus=1
+        FROM b_values9 
+        WHERE mis_auto_hlutv.id = b_values9.id;
+		
+    END;
+  END IF;
+ RAISE NOTICE '第二个 入库节点%',NOW();     
+  IF 2=2 THEN
+    BEGIN
+		-- 计算两票制费用	
+      UPDATE mis_auto_hlutv SET 
+        jisuanliangpiaozhifeiyong = gaokaishouru * 1.13 * 0.87115,
+        jisuanliangpiaozhifeiyongzonge=0,
+        zhangshangliangpiaozhifeiyong=0,
+        zhangshangliangpiaozhifeiyongzonge=0 WHERE cperiod = s_cperiod;
+      
+      -- 查询1-X月的计算两票制费用总额
+      SELECT SUM(jisuanliangpiaozhifeiyong) INTO v_jisuanliangpiaozhifeiyong
+              FROM mis_auto_hlutv
+              WHERE cperiod = s_cperiod;
+      /*
+        计算两票制费用总额(小于等于当前期间,并且在当前年内)
+      */								
+      UPDATE mis_auto_hlutv SET jisuanliangpiaozhifeiyongzonge = ifnull(v_jisuanliangpiaozhifeiyong,0)  WHERE mis_auto_hlutv.cperiod = s_cperiod;
+			
+      -- 计算账上两票制费用总额(来源)
+      /*
+       BIP系统,《辅助余额表》,核算账簿(012-0001)、会计科目(660141销售费用/学术推广费)
+       、明细核算部门-自定义(包含下级、009四总部(司))、会计期间(1-X月),勾选未记账凭证,取借方累计合计
+       1、先查询辅助余额表的总数
+       2、写入骨干表
+      */
+      SELECT SUM(cresum) into v_cresum FROM mis_auto_vdemf WHERE cperiod =s_cperiod
+        AND mis_auto_vdemf.pk_accountingbook = '1001A11000000000LBJX'
+        AND mis_auto_vdemf.pk_accasoa = '1001A11000000000GG0I' 																		   
+        AND mis_auto_vdemf.docf55 IN ('1001A11000000001P4A5','1001A11000000001P4B8','1001A11000000001P4BG','1001A11000000001P4BO','1001A11000000005YC9X');
+      -- 反写骨干表
+      UPDATE mis_auto_hlutv SET zhangshangliangpiaozhifeiyongzonge = v_cresum  WHERE cperiod=s_cperiod;
+      -- 计算账上两票制费用 
+      /*
+        账上两票制费用总额/计算两票制费用总额*计算两票制费用列	
+      */
+      UPDATE mis_auto_hlutv SET zhangshangliangpiaozhifeiyong =zhangshangliangpiaozhifeiyongzonge / jisuanliangpiaozhifeiyongzonge * jisuanliangpiaozhifeiyong		   
+      WHERE cperiod = s_cperiod and jisuanliangpiaozhifeiyongzonge<>0;
+		
+    END;
+	END IF;
+ RAISE NOTICE '第三个 入库节点%',NOW(); 
+IF 33=33 THEN
+    /*
+      根据物料规格分组计算主数量和贷方总金额
+    */
+    -- 起始修改默认值
+    UPDATE mis_auto_hlutv SET wuliao_zhushuliang=0,fachushangpinchengben=0,fachushangpindaifangdanjia=0,fachushangpinyue_daifangjinezonge=0,fachushangpinyue_daifangjine=0 where cperiod = s_cperiod;
+    
+    -- 物料主数量
+	UPDATE mis_auto_hlutv SET wuliao_zhushuliang = t.shuliang FROM (
+		-- 鼻窦炎：按新规格汇总
+		SELECT SUM(zhushuliang) shuliang,xinguige,NULL AS wuliaobianma FROM mis_auto_hlutv 
+			WHERE cperiod = s_cperiod  AND wuliaomingcheng like '%鼻窦炎%' 
+		GROUP BY xinguige
+
+		UNION ALL
+
+		-- 锁阳：按物料编码汇总
+		SELECT SUM(zhushuliang) shuliang,NULL AS xinguige,wuliaobianma FROM mis_auto_hlutv 
+			WHERE cperiod = s_cperiod  AND wuliaomingcheng like '%锁阳%' 
+		GROUP BY wuliaobianma
+	) t
+	WHERE mis_auto_hlutv.cperiod = s_cperiod
+	AND (
+        -- 鼻窦炎：按xinguige匹配
+        (mis_auto_hlutv.wuliaomingcheng LIKE '%鼻窦炎%' AND mis_auto_hlutv.xinguige = t.xinguige)
+        OR
+        -- 锁阳：按wuliaobianma匹配
+        (mis_auto_hlutv.wuliaomingcheng LIKE '%锁阳%' AND mis_auto_hlutv.wuliaobianma = t.wuliaobianma)
+    );
+  
+    /*-- 《发出商品余额查询》贷方金额总额 1-X月并且根据物料规格分组汇总的贷方总金额
+    UPDATE mis_auto_hlutv r SET fachushangpinyue_daifangjinezonge = t.ncreditmny
+    from (select sum(s.ncreditmny) ncreditmny,substring(m.materialspec from '([0-9]+支)') materialspec FROM mis_auto_sosgv s
+       INNER JOIN mis_auto_rbyld m ON s.cinventoryid = m.pk_material
+       WHERE s.pk_book = '1001A11000000000LBJX' AND s.cperiod <= s_cperiod and left(s.cperiod,4) = v_year
+            and m.name like '%鼻窦炎%'
+      group by substring(m.materialspec from '([0-9]+支)')) t
+    WHERE substring(r.guige from '([0-9]+支)') = t.materialspec AND cperiod=s_cperiod;*/
+	
+	-- 发出商品贷方金额总额
+	UPDATE mis_auto_hlutv r 
+	SET fachushangpinyue_daifangjinezonge = t.ncreditmny
+	FROM (
+		-- 鼻窦炎：按规格分组
+		SELECT 
+			SUM(s.ncreditmny) ncreditmny,
+			substring(m.materialspec from '([0-9]+支)') AS materialspec,
+			NULL AS wuliaobianma
+		FROM mis_auto_sosgv s
+		INNER JOIN mis_auto_rbyld m ON s.cinventoryid = m.pk_material
+		WHERE s.pk_book = '1001A11000000000LBJX' 
+		  AND s.cperiod <= s_cperiod 
+		  AND left(s.cperiod,4) = v_year
+		  AND m.name LIKE '%鼻窦炎%'
+		GROUP BY substring(m.materialspec from '([0-9]+支)')
+
+		UNION ALL
+
+		-- 锁阳：按物料编码分组
+		SELECT 
+			SUM(s.ncreditmny) ncreditmny,
+			NULL AS materialspec,
+			m.code AS wuliaobianma
+		FROM mis_auto_sosgv s
+		INNER JOIN mis_auto_rbyld m ON s.cinventoryid = m.pk_material
+		WHERE s.pk_book = '1001A11000000000LBJX' 
+		  AND s.cperiod <= s_cperiod 
+		  AND left(s.cperiod,4) = v_year
+		  AND m.name LIKE '%锁阳%'
+		GROUP BY m.code
+	) t
+	WHERE 
+		r.cperiod = s_cperiod
+		AND (
+			(r.wuliaomingcheng LIKE '%鼻窦炎%' AND substring(r.guige from '([0-9]+支)') = t.materialspec)
+			OR
+			-- 锁阳匹配规则
+			(r.wuliaomingcheng LIKE '%锁阳%' AND r.wuliaobianma = t.wuliaobianma)
+		);	
+  
+    -- 发出商品贷方单价 = 查询出的贷方金额总额/规格汇总的主数量
+	  UPDATE mis_auto_hlutv SET fachushangpindaifangdanjia = fachushangpinyue_daifangjinezonge /wuliao_zhushuliang WHERE cperiod = s_cperiod and wuliao_zhushuliang<>0;
+    
+    -- 发出商品成本 = 贷方单价*主数量
+    UPDATE mis_auto_hlutv SET fachushangpinchengben = fachushangpindaifangdanjia * zhushuliang WHERE cperiod = s_cperiod;
+	
+	
+  end if;	
+  RAISE NOTICE '第四个 入库节点%',NOW(); 
+  
+ 
+IF 4=4 THEN
+	BEGIN
+    -- 标准三栏式明细账汇总借方合计；
+    SELECT SUM(a.localdebitamount) into v_localdebitamount1 FROM mis_auto_awwlc a
+			WHERE 
+        LEFT(a.cperiod, 4) = LEFT(s_cperiod, 4)
+				AND a.cperiod <=s_cperiod 
+		AND (a.explanation LIKE '%鼻窦炎%' OR a.explanation LIKE '%骨干%')
+				AND a.pk_accountingbook = '1001A11000000000LBJX'
+				AND a.pk_accasoa = '1001A1100000001PSAPG';
+    -- 手动新增三栏式明细账汇总借方合计；
+    SELECT SUM(a.localdebitamount) into v_localdebitamount2 FROM mis_auto_awwlc a
+			WHERE 
+        LEFT(a.cperiod, 4) = LEFT(s_cperiod, 4)
+				AND a.cperiod <= s_cperiod 
+        AND (a.explanation LIKE '%鼻窦炎%' OR a.explanation LIKE '%骨干%')
+			  AND ifnull(pk_accasoa,'')='';
+    
+		-- 《三栏式明细账》 借方合计
+		UPDATE mis_auto_hlutv r SET jiefangheji = ifnull(v_localdebitamount1,0)+ifnull(v_localdebitamount2,0) WHERE r.cperiod = s_cperiod;
+    
+		-- 总运费 = 借方合计+财务部月度提供
+		UPDATE mis_auto_hlutv SET zongyunfei = jiefangheji,yunfei=0 WHERE cperiod=s_cperiod;
+		
+		-- 件数合计
+		UPDATE mis_auto_hlutv SET jianshuheji = 
+			(SELECT SUM(jianshu) FROM mis_auto_hlutv WHERE cperiod =s_cperiod AND wuliaomingcheng LIKE '%鼻窦炎%') 
+		WHERE cperiod=s_cperiod AND wuliaomingcheng LIKE '%鼻窦炎%';		
+		
+		-- 运费	
+		UPDATE mis_auto_hlutv SET yunfei =  jianshu / jianshuheji * zongyunfei WHERE cperiod=s_cperiod AND ifnull(jianshuheji,0)<>0
+		and wuliaomingcheng LIKE '%鼻窦炎%';
+		
+    -- 5.9 关联 jwlup 更新(含研发分摊)
+    UPDATE mis_auto_hlutv t
+      SET
+        danweiyanfachengben = COALESCE(j.ncost, 0) / NULLIF(j.nnum, 0) ,
+        yanfachengben = COALESCE(j.ncost, 0) / NULLIF(j.nnum, 0) * COALESCE(t.zhushuliang, 0)
+        -- fcspcb_hyf = COALESCE(fachushangpinchengben,0)+COALESCE(j.ncost, 0) / NULLIF(j.nnum, 0) * COALESCE(t.zhushuliang, 0)
+    FROM mis_auto_jwlup j
+    WHERE t.cperiod = s_cperiod
+    AND j.cperiod = t.cperiod
+    AND j.cmaterialid = t.cmaterialvid
+    AND j.pk_book = '1';
+    
+    update mis_auto_hlutv set fcspcb_hyf = COALESCE(fachushangpinchengben,0)+COALESCE(yanfachengben,0) where cperiod = s_cperiod ;
+    --针对鼻窦炎将单位研发成本和研发成本修改为0
+    update  mis_auto_hlutv set danweiyanfachengben=0 ,yanfachengben=0 where cperiod = s_cperiod and  wuliaomingcheng LIKE '%鼻窦炎%';
+    
+		-- 主营业务成本  
+		UPDATE mis_auto_hlutv SET zhuyingyewuchengben = COALESCE(fcspcb_hyf,0) + COALESCE(yunfei,0) WHERE cperiod=s_cperiod;
+		
+		-- 底价收入(0.87115口径)
+		UPDATE mis_auto_hlutv SET dijiashouru_087115 = COALESCE(wushuijineheji,0) - COALESCE(zhangshangliangpiaozhifeiyong,0) WHERE cperiod=s_cperiod;	
+	
+	END;
+	END IF;
+	 RAISE NOTICE '第五个 入库节点%',NOW(); 
+  IF 5=5 THEN  --2.1.3.5. 计算销售费用
+	BEGIN
+    
+		-- 按【物料名称】汇总 底价收入(0.87115口径) 合计
+		UPDATE mis_auto_hlutv
+		SET dijiashouruheji_087115 = t.total_income
+		FROM (
+			SELECT
+				wuliaomingcheng,
+				SUM(dijiashouru_087115) AS total_income  -- 按品种分组汇总
+			FROM mis_auto_hlutv
+			WHERE 
+				cperiod = s_cperiod
+				AND (wuliaomingcheng LIKE '%鼻窦炎%' OR wuliaomingcheng LIKE '%锁阳%')
+			GROUP BY wuliaomingcheng 
+		) t
+		WHERE 
+			mis_auto_hlutv.cperiod = s_cperiod
+			AND mis_auto_hlutv.wuliaomingcheng = t.wuliaomingcheng;
+		
+		-- 例行费用明细N列
+		CALL Cost_Data_Routine_Fee_Detail_New(s_cperiod, v_sub_result, v_sub_msg);
+		RAISE NOTICE '调用子例行费用分摊结果：% | %',v_sub_result,v_sub_msg;
+		
+		CALL Cost_Sales_balance_GT(s_cperiod, v_sub_result, v_sub_msg);
+		RAISE NOTICE '调用子例行费用分摊结果：% | %',v_sub_result,v_sub_msg;
+		
+    
+		-- 二级账例行费用合计
+	   WITH fee_by_products AS (
+		  SELECT
+      t.cinvcode as wuliaobianma,
+			m.name AS wuliaomingcheng,
+			SUM(y.localdebitamount) AS product_total_amount
+		  FROM mis_auto_yvbre Y
+		  JOIN mis_auto_rbyld m 
+			ON y.docf6 = m.pk_material
+		  INNER JOIN (
+			SELECT masid, cinvcode 
+			FROM mis_auto_niyzt_sub_dijiamingxi 
+			INNER JOIN mis_auto_niyzt
+			  ON mis_auto_niyzt.id = mis_auto_niyzt_sub_dijiamingxi.masid 
+			WHERE mis_auto_niyzt."isVoid"=0 
+			  AND mis_auto_niyzt.status=1 
+			  AND mis_auto_niyzt_sub_dijiamingxi.isVoid =0 
+			  AND mis_auto_niyzt.cperiod = s_cperiod  
+			GROUP BY masid, cinvcode
+		  ) t 
+			ON t.cinvcode = m.code
+		  WHERE
+			y.pk_accountingbook = '1001A11000000029X0P7'
+			AND y.cperiod <= s_cperiod 
+			AND LEFT(y.cperiod, 4) = v_year
+			AND (m.name LIKE '%鼻窦炎%' OR m.name LIKE '%锁阳%')
+		  -- GROUP BY m.name  -- 按品种分组汇总
+      GROUP BY t.cinvcode -- 按品种分组汇总
+		),
+		
+		income_by_products AS (
+		  SELECT
+      wuliaobianma,
+			wuliaomingcheng,
+			SUM(dijiashouru_087115) AS product_total_income
+		  FROM mis_auto_hlutv  --骨干销售利润分析
+		  WHERE cperiod = s_cperiod
+		  AND (wuliaomingcheng LIKE '%鼻窦炎%' OR wuliaomingcheng LIKE '%锁阳%')
+		  GROUP BY wuliaobianma,wuliaomingcheng
+		)
+    
+		UPDATE mis_auto_hlutv
+		SET 
+		  erjizhanglixingfeiyongheji = COALESCE(f.product_total_amount, 0),
+		  erjizhanglixingfeiyong = 
+			CASE WHEN COALESCE(i.product_total_income, 0) = 0 THEN 0
+				 ELSE f.product_total_amount / i.product_total_income * mis_auto_hlutv.dijiashouru_087115
+			END
+		FROM fee_by_products f
+		JOIN income_by_products i 
+		  ON f.wuliaobianma = i.wuliaobianma
+		WHERE 
+		  mis_auto_hlutv.cperiod = s_cperiod
+		  AND mis_auto_hlutv.wuliaobianma = f.wuliaobianma;
+    
+		-- 总例行费用合计  
+		SELECT SUM(cresum) into vv_cresum FROM mis_auto_vdemf v
+			LEFT JOIN mis_auto_ajsmf f ON f.pk_accasoa = v.pk_accasoa -- AND f.pid = '1001A11000000000EG4A'
+			WHERE v.docf55 IN ('1001A11000000001P4A5','1001A11000000005YC9X')
+			AND v.pk_accountingbook = '1001A11000000000LBJX'
+      AND f.pid = '1001A11000000000EG4A'
+			AND v.cperiod = s_cperiod;
+      
+		UPDATE mis_auto_hlutv SET zonglixingfeiyongheji =  vv_cresum WHERE cperiod = s_cperiod;
+	
+		-- 除二级账例行费用合计 = 总费用 - 鼻窦炎二级账 - 锁阳二级账
+		UPDATE mis_auto_hlutv
+		SET chuerjizhanglixingfeiyongheji = t.chufa_total
+		FROM (
+		  SELECT
+			cperiod,
+			MAX(zonglixingfeiyongheji) 
+			- 
+			(
+			  -- 直接取鼻窦炎的数
+			  MAX(CASE WHEN wuliaomingcheng LIKE '%鼻窦炎%' THEN erjizhanglixingfeiyongheji ELSE 0 END)
+			  +
+			  -- 直接取锁阳的数
+			  MAX(CASE WHEN wuliaomingcheng LIKE '%锁阳%' THEN erjizhanglixingfeiyongheji ELSE 0 END)
+			) AS chufa_total
+		  FROM mis_auto_hlutv
+		  WHERE cperiod = s_cperiod
+		  GROUP BY cperiod
+		) t
+		WHERE mis_auto_hlutv.cperiod = t.cperiod;
+		
+		/*-- 除二级账例行费用 = 
+		UPDATE mis_auto_hlutv SET chuerjizhanglixingfeiyong = CASE WHEN NULLIF(dijiashouruheji_087115, 0) = 0 THEN 0 
+			WHEN wuliaomingcheng LIKE '%锁阳固精丸%' THEN 0
+			ELSE chuerjizhanglixingfeiyongheji / dijiashouruheji_087115 * dijiashouru_087115 
+			END 
+		WHERE cperiod=s_cperiod;*/
+		
+		
+		-- 除二级账例行费用：只算鼻窦炎口服液
+		UPDATE mis_auto_hlutv 
+		SET chuerjizhanglixingfeiyong = 
+		  CASE 
+			WHEN wuliaomingcheng LIKE '%锁阳%' THEN 0  
+			WHEN NULLIF(dijiashouruheji_087115, 0) = 0 THEN 0
+			WHEN wuliaomingcheng LIKE '%鼻窦炎%' THEN
+			  ROUND( chuerjizhanglixingfeiyongheji / dijiashouruheji_087115 * dijiashouru_087115, 8 )
+			ELSE 0
+		  END 
+		WHERE cperiod = s_cperiod;
+		
+		-- 例行费用合计		
+		UPDATE mis_auto_hlutv SET lixingfeiyongheji = erjizhanglixingfeiyong + chuerjizhanglixingfeiyong WHERE cperiod=s_cperiod;
+		
+		-- 销售费用
+		UPDATE mis_auto_hlutv SET xiaoshoufeiyong = COALESCE(zhangshangliangpiaozhifeiyong, 0) + lixingfeiyongheji,jsxsfy=jisuanliangpiaozhifeiyong+lixingfeiyongheji WHERE cperiod=s_cperiod;
+  
+	END;
+	END IF;
+		 RAISE NOTICE '第六个 入库节点%',NOW(); 
+  
+	  --计算完成,执行期间不相同数据删除
+	  ---delete from mis_auto_hlutv where icperiodst=0;
+	  -- delete from Cost_Sales_balance where istaipe=0;
+   
+	   -- 期间费用分摊计算
+		CALL Cost_Data_Cost_Sales_Qijianfeiyong_GGYAO(s_cperiod, v_sub_result, v_sub_msg);
+		RAISE NOTICE '调用期间费用分摊结果：% | %', v_sub_result, v_sub_msg;
+
+
+  result := 1;
+  msg := '例行费用明细N列计算，处理成功';
+
+EXCEPTION
+    WHEN OTHERS THEN
+        result := -1;
+        msg := SQLERRM;
+        RAISE NOTICE '异常：%', SQLERRM;
+	  
+END;
+$BODY$
+  LANGUAGE plpgsql

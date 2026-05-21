@@ -1,0 +1,1084 @@
+﻿CREATE OR REPLACE PROCEDURE "public"."Cost_Data_Cost_Sales_Nospecialty_Drugs_Jyyc"(
+    IN "p_target_date" varchar,
+    INOUT "result" int4,
+    INOUT "msg" text
+)
+AS $BODY$
+DECLARE
+    v_yesterday VARCHAR(10);
+    v_cperiod VARCHAR(7);
+    v_cperiod_year VARCHAR(4);
+    v_start_date VARCHAR(10);
+    v_last_month_period VARCHAR(7);
+    v_source_count INT;
+    v_sub_result INT4 DEFAULT 1;
+    v_sub_msg TEXT DEFAULT '';
+BEGIN
+    result := 1;
+    msg := 'Procedure initialized';
+
+    IF COALESCE(BTRIM(p_target_date), '') = '' THEN
+        result := 0;
+        msg := 'Parameter p_target_date is required';
+        RETURN;
+    END IF;
+
+    v_yesterday := TO_CHAR(CAST(p_target_date AS DATE) - INTERVAL '1 day', 'YYYY-MM-DD');
+    v_cperiod := SUBSTRING(v_yesterday, 1, 7);
+    v_cperiod_year := SPLIT_PART(v_cperiod, '-', 1);
+    v_start_date := CONCAT(v_cperiod, '-01');
+    v_last_month_period := TO_CHAR(CAST(v_start_date AS DATE) - INTERVAL '1 month', 'YYYY-MM');
+
+    DELETE FROM public.mis_auto_jyycmx
+    WHERE hesuanqijian = v_cperiod
+      AND COALESCE(pinzhongleixing, '') = '普药非新特药';
+
+    DROP TABLE IF EXISTS temp_ns_sale_ids;
+    CREATE TEMP TABLE temp_ns_sale_ids AS
+    SELECT
+        p.id
+    FROM mis_auto_ptpcr p
+    LEFT JOIN public.mis_auto_jyycmx j
+        ON j.hesuanqijian = v_cperiod
+       AND j.srcid = CAST(p.id AS VARCHAR)
+       AND COALESCE(j.pinzhongleixing, '') IN ('新特药', '骨干')
+    LEFT JOIN public.mis_auto_xinteyao_lirun_mingxi xm
+        ON xm.jisuanqijian = v_cperiod
+       AND CAST(xm.srcid AS VARCHAR) = CAST(p.id AS VARCHAR)
+    LEFT JOIN public.mis_auto_hlutv hl
+        ON hl.cperiod = v_cperiod
+       AND CAST(hl.saleID AS VARCHAR) = CAST(p.id AS VARCHAR)
+    WHERE p.cperiod = v_cperiod
+      AND CAST(p.dbilldate AS DATE) >= CAST(v_start_date AS DATE)
+      AND CAST(p.dbilldate AS DATE) <= CAST(v_yesterday AS DATE)
+      AND j.srcid IS NULL
+      AND xm.srcid IS NULL
+      AND hl.saleID IS NULL
+    GROUP BY p.id;
+
+    DROP TABLE IF EXISTS temp_xt_sale_ids;
+    CREATE TEMP TABLE temp_xt_sale_ids AS
+    SELECT DISTINCT
+        CAST(j.srcid AS BIGINT) AS id
+    FROM public.mis_auto_jyycmx j
+    WHERE j.hesuanqijian = v_cperiod
+      AND COALESCE(j.pinzhongleixing, '') = '新特药'
+      AND j.srcid ~ '^[0-9]+$'
+      AND CAST(j.chukudanjuriqi AS DATE) >= CAST(v_start_date AS DATE)
+      AND CAST(j.chukudanjuriqi AS DATE) <= CAST(v_yesterday AS DATE);
+
+    DROP TABLE IF EXISTS temp_shared_sale_ids;
+    CREATE TEMP TABLE temp_shared_sale_ids AS
+    SELECT id FROM temp_ns_sale_ids
+    UNION
+    SELECT id FROM temp_xt_sale_ids;
+
+    SELECT COUNT(*)
+    INTO v_source_count
+    FROM temp_shared_sale_ids;
+
+    IF COALESCE(v_source_count, 0) = 0 THEN
+        result := 1;
+        msg := CONCAT('No shared forecast source data found. Period: ', v_cperiod, ', range: ', v_start_date, ' to ', v_yesterday);
+        RETURN;
+    END IF;
+
+    -- 直接使用 public.mis_auto_jyycmx 作为经营预测结果及工作表，不再创建同名临时表。
+
+    DROP TABLE IF EXISTS temp_ldttj_customer_mode;
+    CREATE TEMP TABLE temp_ldttj_customer_mode AS
+    SELECT
+        CASE
+            WHEN EXISTS (
+                SELECT 1
+                FROM mis_auto_ldttj mas
+                INNER JOIN mis_auto_ldttj_sub_dijiamingxi up
+                    ON up.masid = mas.id
+                WHERE mas.cperiod = v_last_month_period
+                  AND mas.status = 1
+                  AND mas.isvoid = 0
+                  AND up.isvoid = 0
+                  AND NULLIF(BTRIM(COALESCE(up.customer, '')), '') IS NOT NULL
+            ) THEN 1
+            ELSE 0
+        END AS has_customer_dim;
+
+    DROP TABLE IF EXISTS temp_mis_auto_ldttj;
+    CREATE TEMP TABLE temp_mis_auto_ldttj AS
+    SELECT *
+    FROM (
+        SELECT
+            p.id AS invoice_id,
+            COALESCE(CAST(NULLIF(TRIM(up.price::TEXT), '') AS NUMERIC(24,8)), 0) AS price,
+            ROW_NUMBER() OVER (
+                PARTITION BY p.id
+                ORDER BY
+                    CASE
+                        WHEN mode.has_customer_dim = 1
+                         AND NULLIF(BTRIM(COALESCE(up.customer, '')), '') = NULLIF(BTRIM(COALESCE(lbvrh.name, '')), '') THEN 1
+                        ELSE 2
+                    END,
+                    up.id
+            ) AS rn
+        FROM mis_auto_ptpcr p
+        INNER JOIN temp_ns_sale_ids s
+            ON s.id = p.id
+        CROSS JOIN temp_ldttj_customer_mode mode
+        LEFT JOIN mis_auto_yuorb dep
+            ON dep.pk_vid = p.cdeptvid
+        LEFT JOIN mis_auto_lbvrh lbvrh
+            ON lbvrh.pk_cust_sup_v = p.cinvoicecustid
+        LEFT JOIN mis_auto_ldttj mas
+            ON mas.cperiod = v_last_month_period
+           AND mas.status = 1
+           AND mas.isvoid = 0
+        LEFT JOIN mis_auto_ldttj_sub_dijiamingxi up
+            ON up.masid = mas.id
+           AND up.cinvcode = p.material_code
+           AND up.saledeptcode = dep.code
+           AND (
+                (
+                    mode.has_customer_dim = 1
+                    AND NULLIF(BTRIM(COALESCE(up.customer, '')), '') = NULLIF(BTRIM(COALESCE(lbvrh.name, '')), '')
+                )
+                OR (
+                    mode.has_customer_dim = 0
+                    AND NULLIF(BTRIM(COALESCE(up.customer, '')), '') IS NULL
+                )
+           )
+           AND up.isvoid = 0
+    ) matched_price
+    WHERE rn = 1;
+
+    DROP TABLE IF EXISTS temp_mis_auto_tbdua;
+    CREATE TEMP TABLE temp_mis_auto_tbdua AS
+    SELECT *
+    FROM (
+        SELECT
+            p.id AS invoice_id,
+            tb.measrate,
+            ROW_NUMBER() OVER (
+                PARTITION BY p.id
+                ORDER BY
+                    CASE WHEN RIGHT(COALESCE(p.material_spec, ''), 1) = tu.name THEN 1 ELSE 2 END,
+                    tb.pk_measdoc
+            ) AS rn
+        FROM mis_auto_ptpcr p
+        INNER JOIN temp_ns_sale_ids s
+            ON s.id = p.id
+        INNER JOIN mis_auto_rbyld r
+            ON r.pk_material = p.cmaterialvid
+        INNER JOIN mis_auto_tbdua tb
+            ON r.pk_material = tb.pk_material
+        LEFT JOIN mis_auto_tutyp tu
+            ON tu.pk_measdoc = tb.pk_measdoc
+    ) matched_unit
+    WHERE rn = 1;
+
+    INSERT INTO public.mis_auto_jyycmx (
+        id, srcid, hesuanqijian, fapiaoqijian, chukudanjuriqi, jinshuipiaohao,
+        csaleinvoiceid1, jinshuikaipiaoriqi, shijichukuriqi, kaipiaokehu,
+        xiaoshoubumen, xiaoshoubumenduiyingdiqu, xiaoshouyewuyuan,
+        xiaoshouqudao, qudaoyewuyuan, diqufenlei, shengshiqu, yetai,
+        pinzhongleixing, pinzhong, pingzhenghao, wuliaobianma, wuliaomingcheng,
+        guige, zhushuliang, jianshu, zhuhanshuidanjia, zhuhanshuijingjia,
+        wushuijineheji, jiashuiheji, feiyongchongdijine, chongdiqianjine,
+        zhekoue, cdq_je_bhs, danweidijia, dijiajine,
+        cinvoicecustid, firstvbillcode, cmaterialvid, create_time, istatus
+    )
+    SELECT
+        CAST(p.id AS BIGINT) AS id,
+        CAST(p.id AS VARCHAR) AS srcid,
+        v_cperiod AS hesuanqijian,
+        p.cperiod AS fapiaoqijian,
+        p.dbilldate AS chukudanjuriqi,
+        p.vdef__1 AS jinshuipiaohao,
+        p.csaleinvoiceid1,
+        p.vdef__2 AS jinshuikaipiaoriqi,
+        p.vdef__3 AS shijichukuriqi,
+        p.name_2 AS kaipiaokehu,
+        COALESCE(dep.name, p.name_5) AS xiaoshoubumen,
+        CASE
+            WHEN COALESCE(p.area_name2, '') IN ('四川省', '重庆市') THEN '川渝'
+            ELSE '省外'
+        END AS xiaoshoubumenduiyingdiqu,
+        p.name_6 AS xiaoshouyewuyuan,
+        p.sales_channel AS xiaoshouqudao,
+        p.saleschannelsalesman AS qudaoyewuyuan,
+        p.area_class AS diqufenlei,
+        p.area_name2 AS shengshiqu,
+        p.vdef__5 AS yetai,
+        '普药非新特药' AS pinzhongleixing,
+        p.material_name AS pinzhong,
+        p.num AS pingzhenghao,
+        p.material_code AS wuliaobianma,
+        p.material_name AS wuliaomingcheng,
+        p.material_spec AS guige,
+        CAST(p.nnum AS NUMERIC(24,8)) AS zhushuliang,
+        COALESCE(CAST(p.nnum AS NUMERIC(24,8)), 0) /
+        NULLIF(CAST(NULLIF(SPLIT_PART(COALESCE(tb.measrate, ''), '/', 1), '') AS NUMERIC(24,8)), 0) AS jianshu,
+        CAST(p.norigtaxprice1 AS NUMERIC(24,8)) AS zhuhanshuidanjia,
+        CAST(p.norigtaxnetprice AS NUMERIC(24,8)) AS zhuhanshuijingjia,
+        CAST(p.norigmny1 AS NUMERIC(24,8)) AS wushuijineheji,
+        CAST(p.ntotalincomemny AS NUMERIC(24,8)) AS jiashuiheji,
+        CAST(p.norigsubmny1 AS NUMERIC(24,8)) AS feiyongchongdijine,
+        COALESCE(CAST(p.ntotalincomemny AS NUMERIC(24,8)), 0) + COALESCE(CAST(p.norigsubmny1 AS NUMERIC(24,8)), 0) AS chongdiqianjine,
+        CAST(p.norigdiscount1 AS NUMERIC(24,8)) AS zhekoue,
+        (
+            COALESCE(CAST(p.ntotalincomemny AS NUMERIC(24,8)), 0) +
+            COALESCE(CAST(p.norigsubmny1 AS NUMERIC(24,8)), 0)
+        ) / 1.13 AS cdq_je_bhs,
+        COALESCE(ld.price, 0) AS danweidijia,
+        COALESCE(CAST(p.nnum AS NUMERIC(24,8)), 0) * COALESCE(ld.price, 0) AS dijiajine,
+        p.cinvoicecustid,
+        p.firstvbillcode,
+        p.cmaterialvid,
+        CURRENT_TIMESTAMP AS create_time,
+        0 AS istatus
+    FROM mis_auto_ptpcr p
+    INNER JOIN temp_ns_sale_ids s
+        ON s.id = p.id
+    LEFT JOIN temp_mis_auto_tbdua tb
+        ON tb.invoice_id = p.id
+    LEFT JOIN mis_auto_yuorb dep
+        ON dep.pk_vid = p.cdeptvid
+    LEFT JOIN temp_mis_auto_ldttj ld
+        ON ld.invoice_id = p.id;
+
+    UPDATE public.mis_auto_jyycmx j
+    SET
+        fapiaoqijian = COALESCE(p.cperiod, v_cperiod),
+        csaleinvoiceid1 = COALESCE(j.csaleinvoiceid1, p.csaleinvoiceid1),
+        cinvoicecustid = p.cinvoicecustid,
+        firstvbillcode = p.firstvbillcode,
+        xiaoshoubumenduiyingdiqu = CASE
+            WHEN COALESCE(j.shengshiqu, '') IN ('四川省', '四川', '重庆市', '重庆') THEN '川渝'
+            ELSE '省外'
+        END,
+        pinzhongleixing = '新特药',
+        pinzhong = COALESCE(j.pinzhong, j.wuliaomingcheng),
+        cmaterialvid = p.cmaterialvid,
+        cdq_je_bhs = CAST(COALESCE(j.chongdiqianjine, 0) AS NUMERIC(24,8)) / 1.13,
+        create_time = CURRENT_TIMESTAMP,
+        istatus = 0
+    FROM temp_xt_sale_ids s
+    LEFT JOIN mis_auto_ptpcr p
+        ON p.id = s.id
+    WHERE j.hesuanqijian = v_cperiod
+      AND j.srcid ~ '^[0-9]+$'
+      AND s.id = CAST(j.srcid AS BIGINT)
+      AND COALESCE(j.pinzhongleixing, '') = '新特药';
+
+    DROP TABLE IF EXISTS temp_ns_order_discount;
+    CREATE TEMP TABLE temp_ns_order_discount AS
+    SELECT
+        p.id AS srcid,
+        SUM(COALESCE(b.nnum, 0)) AS sum_nnum,
+        SUM(COALESCE(b.ndiscount, 0)) AS sum_ndiscount
+    FROM mis_auto_ptpcr p
+    INNER JOIN temp_shared_sale_ids s
+        ON s.id = p.id
+    INNER JOIN mis_auto_emwtt o
+        ON o.vbillcode = p.firstvbillcode
+    INNER JOIN mis_auto_emwtt_sub_csaleorderbid b
+        ON o.csaleorderid = b.csaleorderid
+    WHERE p.cmaterialvid = b.cmaterialid
+    GROUP BY p.id;
+
+    DROP TABLE IF EXISTS temp_ns_invoice_material;
+    CREATE TEMP TABLE temp_ns_invoice_material AS
+    SELECT
+        t.csaleinvoiceid1 AS csaleinvoiceid,
+        t.wuliaobianma AS material_code,
+        SUM(COALESCE(o.sum_ndiscount, 0)) AS sum_jine,
+        SUM(COALESCE(o.sum_nnum, 0)) AS sum_shuliang
+    FROM public.mis_auto_jyycmx t
+    LEFT JOIN temp_ns_order_discount o
+        ON CAST(t.srcid AS BIGINT) = o.srcid
+    WHERE t.hesuanqijian = v_cperiod
+      AND COALESCE(t.pinzhongleixing, '') IN ('普药非新特药', '新特药')
+    GROUP BY t.csaleinvoiceid1, t.wuliaobianma;
+
+    WITH lpz AS (
+        SELECT
+            t.id,
+            CASE
+                WHEN COALESCE(im.sum_shuliang, 0) <> 0 THEN COALESCE(im.sum_jine, 0) / im.sum_shuliang
+                ELSE 0
+            END AS alloc_unit_discount,
+            CASE
+                WHEN COALESCE(t.danweidijia, 0) = 0 THEN 0
+                ELSE (COALESCE(t.jiashuiheji, 0) - COALESCE(t.dijiajine, 0)) / 1.13
+            END AS sw_lpz_sr_val,
+            CASE
+                WHEN COALESCE(t.danweidijia, 0) = 0 THEN 0
+                ELSE (COALESCE(t.jiashuiheji, 0) - COALESCE(t.dijiajine, 0)) * 0.87115
+            END AS zs_lpz_fy_val
+        FROM public.mis_auto_jyycmx t
+        LEFT JOIN temp_ns_invoice_material im
+            ON t.csaleinvoiceid1 = im.csaleinvoiceid
+           AND t.wuliaobianma = im.material_code
+        WHERE t.hesuanqijian = v_cperiod
+          AND COALESCE(t.pinzhongleixing, '') IN ('普药非新特药', '新特药')
+    )
+    UPDATE public.mis_auto_jyycmx t
+    SET dq_pz = ROUND(COALESCE(t.zhushuliang, 0) * COALESCE(lpz.alloc_unit_discount, 0) * -1, 8),
+        dq_pz_bhs = ROUND((COALESCE(t.zhushuliang, 0) * COALESCE(lpz.alloc_unit_discount, 0) * -1) / 1.13, 8),
+        sw_lpz_sr = ROUND(lpz.sw_lpz_sr_val, 8),
+        lpz_sr_hj = ROUND(lpz.sw_lpz_sr_val, 8),
+        sw_lpz_sr_hj = ROUND(lpz.sw_lpz_sr_val, 8),
+        js_lpz_fy = ROUND(lpz.zs_lpz_fy_val, 8),
+        zs_lpz_fy = ROUND(lpz.zs_lpz_fy_val, 8),
+        bhdq_pz_cdq_bhs = ROUND(
+            COALESCE(t.cdq_je_bhs, 0) +
+            ((COALESCE(t.zhushuliang, 0) * COALESCE(lpz.alloc_unit_discount, 0) * -1) / 1.13) -
+            COALESCE(lpz.zs_lpz_fy_val, 0),
+            8
+        )
+    FROM lpz
+    WHERE t.id = lpz.id;
+
+    UPDATE public.mis_auto_jyycmx
+    SET lpz_sr_hj = 0
+    WHERE hesuanqijian = v_cperiod
+      AND COALESCE(pinzhongleixing, '') IN ('普药非新特药', '新特药')
+      AND COALESCE(lpz_sr_hj, 0) + COALESCE(chongdiqianjine, 0) = 0;
+
+    IF v_cperiod_year <> '2025' THEN
+        IF NOT EXISTS (
+            SELECT 1
+            FROM pg_proc p
+            INNER JOIN pg_namespace n
+                ON n.oid = p.pronamespace
+            WHERE n.nspname = 'public'
+              AND lower(p.proname) = lower('Cost_Data_Cost_Sales_Nospecialty_Drugs_JYYC_levels3')
+              AND p.prokind = 'p'
+        ) THEN
+            result := -1;
+            msg := 'Missing procedure public.Cost_Data_Cost_Sales_Nospecialty_Drugs_JYYC_levels3. Execute Cost_Data_Cost_Sales_Nospecialty_Drugs_JYYC_levels3.txt first.';
+            RETURN;
+        END IF;
+
+        CALL public.Cost_Data_Cost_Sales_Nospecialty_Drugs_JYYC_levels3(v_cperiod, v_sub_result, v_sub_msg);
+        IF COALESCE(v_sub_result, -1) <> 1 THEN
+            result := -1;
+            msg := CONCAT('Cross-period discount calculation failed: ', COALESCE(v_sub_msg, ''));
+            RETURN;
+        END IF;
+        RAISE NOTICE 'levels3 finished';
+
+        WITH tmp_fdq_agg AS (
+            SELECT
+                target_srcid,
+                denominator,
+                SUM(alloc_fdq_amount) * -1 AS alloc_fdq_amount,
+                SUM(alloc_fdqb_amount) * -1 AS alloc_fdqb_amount
+            FROM tmp_conversion_allocation_normal
+            GROUP BY target_srcid, denominator
+        )
+        UPDATE public.mis_auto_jyycmx t
+        SET fdq_ftamount = '0',
+            fdq_ftnum = CAST(COALESCE(a.denominator, 0) AS VARCHAR),
+            fdq_pz = ROUND(COALESCE(a.alloc_fdq_amount, 0), 8),
+            fdq_pz_bcdq = ROUND(COALESCE(a.alloc_fdqb_amount, 0), 8)
+        FROM tmp_fdq_agg a
+        WHERE CAST(t.srcid AS BIGINT) = a.target_srcid
+          AND t.hesuanqijian = v_cperiod
+          AND COALESCE(t.pinzhongleixing, '') IN ('普药非新特药', '新特药');
+
+        WITH tmp_fdqb_agg AS (
+            SELECT
+                target_srcid,
+                target_amount,
+                SUM(alloc_fdq_amount) * -1 AS alloc_fdq_amount,
+                SUM(alloc_fdqb_amount) * -1 AS alloc_fdqb_amount
+            FROM tmp_conversion_allocation_fallback
+            GROUP BY target_srcid, target_amount
+        )
+        UPDATE public.mis_auto_jyycmx t
+        SET fdqb_ftamount = CAST(COALESCE(a.target_amount, 0) AS VARCHAR),
+            fdqb_ftnum = '0',
+            fdq_pz_jt = ROUND(COALESCE(a.alloc_fdq_amount, 0), 8),
+            fdq_pz_bcdq_jt = ROUND(COALESCE(a.alloc_fdqb_amount, 0), 8)
+        FROM tmp_fdqb_agg a
+        WHERE CAST(t.srcid AS BIGINT) = a.target_srcid
+          AND t.hesuanqijian = v_cperiod
+          AND COALESCE(t.pinzhongleixing, '') IN ('普药非新特药', '新特药');
+
+        UPDATE public.mis_auto_jyycmx
+        SET fdq_pz_hj = ROUND(COALESCE(fdq_pz, 0) + COALESCE(fdq_pz_jt, 0), 8),
+            fdq_pz_bcdq_hj = ROUND(COALESCE(fdq_pz_bcdq, 0) + COALESCE(fdq_pz_bcdq_jt, 0), 8),
+            fdq_pz_bcdq_bhs = ROUND((COALESCE(fdq_pz_bcdq, 0) + COALESCE(fdq_pz_bcdq_jt, 0)) / 1.13, 8),
+            fdq_pz_bhs = ROUND((COALESCE(fdq_pz, 0) + COALESCE(fdq_pz_jt, 0)) / 1.13, 8)
+        WHERE hesuanqijian = v_cperiod
+          AND COALESCE(pinzhongleixing, '') IN ('普药非新特药', '新特药');
+    END IF;
+
+    UPDATE public.mis_auto_jyycmx
+    SET pz_hj = ROUND(COALESCE(dq_pz, 0) + COALESCE(fdq_pz_bcdq_hj, 0) + COALESCE(fdq_pz_hj, 0), 8)
+    WHERE hesuanqijian = v_cperiod
+      AND COALESCE(pinzhongleixing, '') IN ('普药非新特药', '新特药');
+
+    DROP TABLE IF EXISTS tmp_material_sales;
+    CREATE TEMP TABLE tmp_material_sales AS
+    SELECT
+        p.cmaterialvid,
+        SUM(COALESCE(CAST(p.nnum AS NUMERIC(24,8)), 0)) AS total_nnum
+    FROM mis_auto_ptpcr p
+    INNER JOIN temp_shared_sale_ids s
+        ON s.id = p.id
+    GROUP BY p.cmaterialvid;
+
+    DROP TABLE IF EXISTS tmp_pz_sale1;
+    CREATE TEMP TABLE tmp_pz_sale1 AS
+    SELECT
+        t.cmaterialvid,
+        SUM(COALESCE(t.fdq_pz_hj, 0) + COALESCE(t.fdq_pz_bcdq_hj, 0)) AS total_pz
+    FROM public.mis_auto_jyycmx t
+    INNER JOIN mis_auto_ptpcr p
+        ON p.id = CAST(t.srcid AS BIGINT)
+       AND p.cmaterialvid = t.cmaterialvid
+    LEFT JOIN mis_auto_yuorb y
+        ON y.pk_vid = p.cdeptvid
+    WHERE t.hesuanqijian = v_cperiod
+      AND COALESCE(t.pinzhongleixing, '') IN ('普药非新特药', '新特药')
+      AND COALESCE(y.name, '') = '医疗事业部'
+    GROUP BY t.cmaterialvid;
+
+    DROP TABLE IF EXISTS tmp_saleamount;
+    CREATE TEMP TABLE tmp_saleamount AS
+    SELECT
+        cperiod,
+        material_code,
+        saledeptcode,
+        saledeptname,
+        saleamount,
+        hbtype
+    FROM mis_auto_djmpl
+    WHERE cperiod = v_cperiod;
+
+    DROP TABLE IF EXISTS tmp_multi_group;
+    CREATE TEMP TABLE tmp_multi_group AS
+    SELECT
+        saledeptcode,
+        saleamount AS group_saleamount
+    FROM tmp_saleamount
+    WHERE COALESCE(hbtype, '') = '多部门';
+
+    DROP TABLE IF EXISTS tmp_pz_multi;
+    CREATE TEMP TABLE tmp_pz_multi AS
+    SELECT
+        mg.group_saleamount,
+        SUM(COALESCE(t.fdq_pz_hj, 0) + COALESCE(t.fdq_pz_bcdq_hj, 0)) AS total_pz
+    FROM public.mis_auto_jyycmx t
+    INNER JOIN mis_auto_ptpcr p
+        ON p.id = CAST(t.srcid AS BIGINT)
+       AND p.cmaterialvid = t.cmaterialvid
+    INNER JOIN mis_auto_yuorb y
+        ON y.pk_vid = p.cdeptvid
+    INNER JOIN tmp_multi_group mg
+        ON mg.saledeptcode = y.code
+    WHERE t.hesuanqijian = v_cperiod
+      AND COALESCE(t.pinzhongleixing, '') IN ('普药非新特药', '新特药')
+    GROUP BY mg.group_saleamount;
+
+    DROP TABLE IF EXISTS tmp_pz_other;
+    CREATE TEMP TABLE tmp_pz_other AS
+    SELECT
+        p.cdeptvid,
+        SUM(COALESCE(t.fdq_pz_hj, 0) + COALESCE(t.fdq_pz_bcdq_hj, 0)) AS total_pz
+    FROM public.mis_auto_jyycmx t
+    LEFT JOIN mis_auto_ptpcr p
+        ON p.id = CAST(t.srcid AS BIGINT)
+       AND p.cmaterialvid = t.cmaterialvid
+    LEFT JOIN mis_auto_yuorb y
+        ON y.pk_vid = p.cdeptvid
+    WHERE t.hesuanqijian = v_cperiod
+      AND COALESCE(t.pinzhongleixing, '') IN ('普药非新特药', '新特药')
+      AND y.code IN (
+          SELECT saledeptcode
+          FROM mis_auto_djmpl
+          WHERE cperiod = v_cperiod
+            AND COALESCE(hbtype, '') = '单部门'
+      )
+    GROUP BY p.cdeptvid;
+
+    DROP TABLE IF EXISTS tmp_dept_hytype;
+    CREATE TEMP TABLE tmp_dept_hytype AS
+    SELECT DISTINCT ON (saledeptcode)
+        saledeptcode,
+        hbtype
+    FROM mis_auto_djmpl
+    WHERE cperiod = v_cperiod
+      AND saledeptcode IS NOT NULL
+    ORDER BY saledeptcode;
+
+    DROP TABLE IF EXISTS tmp_updates;
+    CREATE TEMP TABLE tmp_updates AS
+    WITH base AS (
+        SELECT
+            t.csaleinvoiceid1 AS csaleinvoiceid,
+            t.id,
+            t.hesuanqijian AS cperiod,
+            t.srcid,
+            t.cmaterialvid,
+            t.wuliaobianma AS material_code,
+            t.zhushuliang AS nnum,
+            t.fdq_pz_hj,
+            t.fdq_pz_bcdq_hj,
+            t.cdq_je_bhs,
+            t.fdq_pz_bhs,
+            t.fdq_pz_bcdq_bhs,
+            t.dq_pz_bhs,
+            t.zs_lpz_fy,
+            p.cdeptvid,
+            y.code AS dept_code,
+            y.name AS dept_name,
+            p.sales_channel,
+            p.cemployeeid,
+            COALESCE(ms.total_nnum, 0) AS invoicenum
+        FROM public.mis_auto_jyycmx t
+        LEFT JOIN mis_auto_ptpcr p
+            ON p.id = CAST(t.srcid AS BIGINT)
+        LEFT JOIN mis_auto_yuorb y
+            ON y.pk_vid = p.cdeptvid
+        LEFT JOIN tmp_material_sales ms
+            ON ms.cmaterialvid = t.cmaterialvid
+        WHERE t.hesuanqijian = v_cperiod
+          AND COALESCE(t.pinzhongleixing, '') IN ('普药非新特药', '新特药')
+    ),
+    base_with_hy AS (
+        SELECT
+            b.*,
+            COALESCE(d.hbtype, '') AS hytype
+        FROM base b
+        LEFT JOIN tmp_dept_hytype d
+            ON d.saledeptcode = b.dept_code
+    ),
+    final_calc AS (
+        SELECT
+            b.*,
+            CASE
+                WHEN COALESCE(b.hytype, '') = '医疗事业部' THEN COALESCE(pz1.total_pz, 0)
+                WHEN COALESCE(b.hytype, '') = '多部门' THEN COALESCE(pzm.total_pz, 0)
+                ELSE COALESCE(pzo.total_pz, 0)
+            END AS total_pz,
+            CASE
+                WHEN COALESCE(b.hytype, '') = '医疗事业部' THEN COALESCE(sa1.saleamount, 0)
+                WHEN COALESCE(b.hytype, '') = '多部门' THEN COALESCE(sam.saleamount, 0)
+                ELSE COALESCE(sao.saleamount, 0)
+            END AS saleamount
+        FROM base_with_hy b
+        LEFT JOIN tmp_pz_sale1 pz1
+            ON pz1.cmaterialvid = b.cmaterialvid
+        LEFT JOIN tmp_pz_other pzo
+            ON pzo.cdeptvid = b.cdeptvid
+        LEFT JOIN tmp_saleamount sa1
+            ON sa1.material_code = b.material_code
+           AND sa1.saledeptcode = b.dept_code
+           AND COALESCE(sa1.hbtype, '') = '医疗事业部'
+        LEFT JOIN tmp_multi_group mg
+            ON mg.saledeptcode = b.dept_code
+        LEFT JOIN tmp_pz_multi pzm
+            ON pzm.group_saleamount = mg.group_saleamount
+        LEFT JOIN tmp_saleamount sam
+            ON sam.saledeptcode = b.dept_code
+           AND COALESCE(sam.hbtype, '') = '多部门'
+        LEFT JOIN tmp_saleamount sao
+            ON sao.saledeptcode = b.dept_code
+           AND (COALESCE(sao.hbtype, '') = '单部门' OR sao.hbtype IS NULL)
+    )
+    SELECT
+        csaleinvoiceid,
+        id,
+        cperiod,
+        srcid,
+        cmaterialvid,
+        nnum,
+        fdq_pz_hj,
+        fdq_pz_bcdq_hj,
+        cdq_je_bhs,
+        fdq_pz_bhs,
+        fdq_pz_bcdq_bhs,
+        dq_pz_bhs,
+        zs_lpz_fy,
+        invoicenum,
+        saleamount,
+        CASE
+            WHEN total_pz <> 0 THEN (COALESCE(fdq_pz_hj, 0) + COALESCE(fdq_pz_bcdq_hj, 0)) / total_pz * saleamount
+            ELSE 0
+        END AS kq_pz_yb_sr
+    FROM final_calc;
+
+    UPDATE public.mis_auto_jyycmx t
+    SET kuaqiwushuitiaozheng = ROUND(COALESCE(u.kq_pz_yb_sr, 0), 8),
+        wushuijinezonge = ROUND(
+            COALESCE(u.kq_pz_yb_sr, 0) +
+            COALESCE(t.cdq_je_bhs, 0) +
+            COALESCE(t.fdq_pz_bhs, 0) +
+            COALESCE(t.fdq_pz_bcdq_bhs, 0) +
+            COALESCE(t.dq_pz_bhs, 0),
+            8
+        ),
+        dijiashouru087115 = ROUND(
+            COALESCE(u.kq_pz_yb_sr, 0) +
+            COALESCE(t.cdq_je_bhs, 0) +
+            COALESCE(t.fdq_pz_bhs, 0) +
+            COALESCE(t.fdq_pz_bcdq_bhs, 0) +
+            COALESCE(t.dq_pz_bhs, 0) -
+            COALESCE(t.zs_lpz_fy, 0),
+            8
+        ),
+        kuaqipiaozhexiaoshou = ROUND(COALESCE(u.saleamount, 0), 8)
+    FROM tmp_updates u
+    WHERE t.hesuanqijian = v_cperiod
+      AND COALESCE(t.pinzhongleixing, '') IN ('普药非新特药', '新特药')
+      AND t.csaleinvoiceid1 = u.csaleinvoiceid
+      AND t.id = u.id;
+    RAISE NOTICE 'income restore source updated';
+
+    UPDATE public.mis_auto_jyycmx
+    SET wushuijinezonge = ROUND(
+            COALESCE(cdq_je_bhs, 0) +
+            COALESCE(dq_pz_bhs, 0) +
+            (COALESCE(fdq_pz_bcdq, 0) / 1.13) +
+            (COALESCE(fdq_pz, 0) / 1.13) +
+            COALESCE(kuaqiwushuitiaozheng, 0),
+            8
+        ),
+        dijiashouru087115 = ROUND(
+            (
+                COALESCE(cdq_je_bhs, 0) +
+                COALESCE(dq_pz_bhs, 0) +
+                (COALESCE(fdq_pz_bcdq, 0) / 1.13) +
+                (COALESCE(fdq_pz, 0) / 1.13) +
+                COALESCE(kuaqiwushuitiaozheng, 0)
+            ) - COALESCE(zs_lpz_fy, 0),
+            8
+        )
+    WHERE hesuanqijian = v_cperiod
+      AND COALESCE(pinzhongleixing, '') IN ('普药非新特药', '新特药');
+    RAISE NOTICE 'income restore finalized';
+
+    DROP TABLE IF EXISTS temp_profit_ref;
+    CREATE TEMP TABLE temp_profit_ref AS
+    SELECT
+        i.material_code,
+        COALESCE(i.nnum, 0) AS nnum,
+        COALESCE(i.yf, 0) AS yf,
+        COALESCE(i.base_price_income_087115, 0) AS base_price_income_087115,
+        COALESCE(i.lx_fy_hj, 0) AS lx_fy_hj,
+        COALESCE(i.sj_jfj, 0) AS sj_jfj,
+        COALESCE(i.gl_fy, 0) AS gl_fy,
+        COALESCE(i.yf_fy, 0) AS yf_fy,
+        COALESCE(i.cw_fy, 0) AS cw_fy
+    FROM public."jspt_Data_Sales_Profit" i
+    WHERE i.cperiod = v_last_month_period
+      AND COALESCE(i.drugstype, '') IN ('普药非新特药', '新特药');
+
+    CREATE INDEX idx_temp_profit_ref_material_code ON temp_profit_ref (material_code);
+    ANALYZE temp_profit_ref;
+
+    DROP TABLE IF EXISTS temp_current_material_codes;
+    CREATE TEMP TABLE temp_current_material_codes AS
+    SELECT DISTINCT wuliaobianma AS material_code
+    FROM public.mis_auto_jyycmx
+    WHERE hesuanqijian = v_cperiod
+      AND COALESCE(pinzhongleixing, '') IN ('普药非新特药', '新特药')
+      AND wuliaobianma IS NOT NULL;
+
+    CREATE INDEX idx_temp_current_material_codes ON temp_current_material_codes (material_code);
+    ANALYZE temp_current_material_codes;
+
+    DROP TABLE IF EXISTS temp_cost_base;
+    CREATE TEMP TABLE temp_cost_base AS
+    SELECT
+        t.cperiod,
+        t.wuliaobianma AS material_code,
+        CAST(COALESCE(t.jiecunjine, 0) AS DECIMAL(18,8)) AS calc_credit_amount,
+        CAST(COALESCE(t.jiecunshuliang, 0) AS DECIMAL(18,8)) AS total_physical_qty,
+        CAST(COALESCE(t.jiecundanjia, 0) AS DECIMAL(18,8)) AS balance_unit_price
+    FROM mis_auto_busdu t
+    INNER JOIN temp_current_material_codes m
+        ON m.material_code = t.wuliaobianma
+    WHERE COALESCE(t."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+      AND NULLIF(TRIM(COALESCE(t.cperiod, '')), '') IS NOT NULL
+      AND NULLIF(TRIM(COALESCE(t.wuliaobianma, '')), '') IS NOT NULL;
+
+    CREATE INDEX idx_temp_cost_base_material_period ON temp_cost_base (material_code, cperiod);
+    ANALYZE temp_cost_base;
+    RAISE NOTICE 'cost rate cache ready';
+
+    DROP TABLE IF EXISTS temp_predict_freight_rate;
+    CREATE TEMP TABLE temp_predict_freight_rate AS
+    SELECT
+        i.material_code,
+        CASE
+            WHEN SUM(COALESCE(i.nnum, 0)) > 0 THEN SUM(COALESCE(i.yf, 0)) / SUM(COALESCE(i.nnum, 0))
+            ELSE 0
+        END AS unit_freight_rate
+    FROM temp_profit_ref i
+    GROUP BY i.material_code;
+    CREATE INDEX idx_temp_predict_freight_rate_material_code ON temp_predict_freight_rate (material_code);
+    ANALYZE temp_predict_freight_rate;
+
+    DROP TABLE IF EXISTS temp_predict_freight_total;
+    CREATE TEMP TABLE temp_predict_freight_total AS
+    SELECT
+        SUM(COALESCE(i.yf, 0)) AS total_period_freight
+    FROM temp_profit_ref i;
+    ANALYZE temp_predict_freight_total;
+
+    DROP TABLE IF EXISTS temp_predict_fee_rate;
+    CREATE TEMP TABLE temp_predict_fee_rate AS
+    WITH routine_rate AS (
+        SELECT
+            CASE
+                WHEN SUM(COALESCE(base_price_income_087115, 0)) > 0
+                    THEN SUM(COALESCE(lx_fy_hj, 0)) / SUM(COALESCE(base_price_income_087115, 0))
+                ELSE 0
+            END AS predict_routine_rate
+        FROM temp_profit_ref
+    ),
+    profit_fee_rate AS (
+        SELECT
+            CASE WHEN SUM(COALESCE(base_price_income_087115, 0)) > 0 THEN SUM(COALESCE(sj_jfj, 0)) / SUM(COALESCE(base_price_income_087115, 0)) ELSE 0 END AS predict_tax_rate,
+            CASE WHEN SUM(COALESCE(base_price_income_087115, 0)) > 0 THEN SUM(COALESCE(gl_fy, 0)) / SUM(COALESCE(base_price_income_087115, 0)) ELSE 0 END AS predict_mgmt_rate,
+            CASE WHEN SUM(COALESCE(base_price_income_087115, 0)) > 0 THEN SUM(COALESCE(yf_fy, 0)) / SUM(COALESCE(base_price_income_087115, 0)) ELSE 0 END AS predict_rd_rate,
+            CASE WHEN SUM(COALESCE(base_price_income_087115, 0)) > 0 THEN SUM(COALESCE(cw_fy, 0)) / SUM(COALESCE(base_price_income_087115, 0)) ELSE 0 END AS predict_fin_rate
+        FROM temp_profit_ref
+    )
+    SELECT
+        COALESCE(r.predict_routine_rate, 0) AS predict_routine_rate,
+        COALESCE(f.predict_tax_rate, 0) AS predict_tax_rate,
+        COALESCE(f.predict_mgmt_rate, 0) AS predict_mgmt_rate,
+        COALESCE(f.predict_rd_rate, 0) AS predict_rd_rate,
+        COALESCE(f.predict_fin_rate, 0) AS predict_fin_rate
+    FROM routine_rate r
+    CROSS JOIN profit_fee_rate f;
+    ANALYZE temp_predict_fee_rate;
+
+    DROP TABLE IF EXISTS temp_agri_deduction_rate;
+    CREATE TEMP TABLE temp_agri_deduction_rate AS
+    SELECT
+        COALESCE((
+            SELECT CAST(COALESCE(CAST(zhanbilv AS VARCHAR), '0') AS DECIMAL(18,8))
+            FROM mis_auto_hjxrz
+            WHERE fenlei = '1'
+              AND COALESCE(CAST(isVoid AS TEXT), '0') = '0'
+              AND NULLIF(TRIM(COALESCE(cperiod, '')), '') IS NOT NULL
+              AND cperiod = v_cperiod
+            ORDER BY cperiod DESC, id DESC
+            LIMIT 1
+        ), 0) AS agri_rate;
+    ANALYZE temp_agri_deduction_rate;
+
+    DROP TABLE IF EXISTS temp_last_month_cost;
+    CREATE TEMP TABLE temp_last_month_cost AS
+    SELECT
+        material_code,
+        CASE WHEN total_physical_qty > 0 THEN COALESCE(balance_unit_price, 0) ELSE 0 END AS last_month_unit_price,
+        calc_credit_amount AS last_month_total_credit,
+        total_physical_qty AS last_month_qty
+    FROM temp_cost_base
+    WHERE cperiod = v_last_month_period
+      AND total_physical_qty > 0;
+    CREATE INDEX idx_temp_last_month_cost_material_code ON temp_last_month_cost (material_code);
+    ANALYZE temp_last_month_cost;
+
+    DROP TABLE IF EXISTS temp_current_material_vids;
+    CREATE TEMP TABLE temp_current_material_vids AS
+    SELECT DISTINCT
+        p.cmaterialvid
+    FROM public.mis_auto_jyycmx t
+    INNER JOIN mis_auto_ptpcr p
+        ON p.id = CAST(t.srcid AS BIGINT)
+    WHERE t.hesuanqijian = v_cperiod
+      AND COALESCE(t.pinzhongleixing, '') IN ('普药非新特药', '新特药')
+      AND p.cmaterialvid IS NOT NULL;
+    CREATE INDEX idx_temp_current_material_vids ON temp_current_material_vids (cmaterialvid);
+    ANALYZE temp_current_material_vids;
+
+    DROP TABLE IF EXISTS temp_new_product_cost;
+    CREATE TEMP TABLE temp_new_product_cost AS
+    SELECT
+        latest_inbound.cmaterialvid AS material_key,
+        latest_inbound.nabprice AS new_product_unit_price
+    FROM (
+        SELECT
+            d.cmaterialvid,
+            d.nabprice,
+            ROW_NUMBER() OVER (
+                PARTITION BY d.cmaterialvid
+                ORDER BY d.dbilldate DESC NULLS LAST, d.id DESC
+            ) AS rn
+        FROM mis_auto_thfjq d
+        WHERE d.cmaterialvid IN (SELECT cmaterialvid FROM temp_current_material_vids)
+          AND COALESCE(d."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+          AND d.cbilltypecode IN ('采购入库单', '产成品入库单')
+    ) latest_inbound
+    WHERE latest_inbound.rn = 1;
+    CREATE INDEX idx_temp_new_product_cost_material_key ON temp_new_product_cost (material_key);
+    ANALYZE temp_new_product_cost;
+    RAISE NOTICE 'recalc reference tables ready';
+
+    DROP TABLE IF EXISTS temp_recalc;
+    CREATE TEMP TABLE temp_recalc AS
+    SELECT
+        t.id,
+        COALESCE(lm.last_month_unit_price, COALESCE(np.new_product_unit_price, 0)) AS unit_cost,
+        COALESCE(lm.last_month_total_credit, 0) AS total_credit,
+        COALESCE(lm.last_month_qty, 0) AS hist_total_qty,
+        COALESCE(ft.total_period_freight, 0) AS total_period_freight,
+        COALESCE(pfr.unit_freight_rate, 0) AS unit_freight_rate,
+        COALESCE(per.predict_routine_rate, 0) AS predict_routine_rate,
+        COALESCE(per.predict_tax_rate, 0) AS predict_tax_rate,
+        COALESCE(per.predict_mgmt_rate, 0) AS predict_mgmt_rate,
+        COALESCE(per.predict_rd_rate, 0) AS predict_rd_rate,
+        COALESCE(per.predict_fin_rate, 0) AS predict_fin_rate,
+        COALESCE(agr.agri_rate, 0) AS agri_rate,
+        ROUND(COALESCE(t.dijiashouru087115, 0), 8) AS income_087115
+    FROM public.mis_auto_jyycmx t
+    LEFT JOIN mis_auto_ptpcr p
+        ON p.id = CAST(t.srcid AS BIGINT)
+    LEFT JOIN temp_last_month_cost lm
+        ON t.wuliaobianma = lm.material_code
+    LEFT JOIN temp_new_product_cost np
+        ON p.cmaterialvid = np.material_key
+    LEFT JOIN temp_predict_freight_rate pfr
+        ON t.wuliaobianma = pfr.material_code
+    CROSS JOIN temp_predict_freight_total ft
+    CROSS JOIN temp_predict_fee_rate per
+    CROSS JOIN temp_agri_deduction_rate agr
+    WHERE t.hesuanqijian = v_cperiod
+      AND COALESCE(t.pinzhongleixing, '') IN ('普药非新特药', '新特药');
+    CREATE INDEX idx_temp_recalc_id ON temp_recalc (id);
+    ANALYZE temp_recalc;
+    RAISE NOTICE 'recalc dataset ready';
+
+    UPDATE public.mis_auto_jyycmx t
+    SET fachushangpindaifangdanjia = ROUND(r.unit_cost, 8),
+        fachushangpinchengben = ROUND(COALESCE(t.zhushuliang, 0) * r.unit_cost, 8),
+        leijifapiaozongshuliang = ROUND(r.hist_total_qty, 8),
+        leijidaifangzonge = ROUND(r.total_credit, 8),
+        zongyunfei = ROUND(r.total_period_freight, 8),
+        yunfei = ROUND(COALESCE(t.zhushuliang, 0) * r.unit_freight_rate, 8),
+        zhuyingyewuchengben = ROUND(
+            (COALESCE(t.zhushuliang, 0) * r.unit_cost)
+            + (COALESCE(t.zhushuliang, 0) * r.unit_cost * r.agri_rate)
+            + (COALESCE(t.zhushuliang, 0) * r.unit_freight_rate),
+            8
+        ),
+        ncpkouchujishu = ROUND(COALESCE(t.zhushuliang, 0) * r.unit_cost, 8),
+        ncpjiajikouchu = ROUND(COALESCE(t.zhushuliang, 0) * r.unit_cost * r.agri_rate, 8),
+        lixingfeiyongheji = CASE
+            WHEN COALESCE(t.pinzhongleixing, '') = '新特药' THEN ROUND(COALESCE(t.lixingfeiyongheji, 0), 8)
+            ELSE ROUND(r.income_087115 * r.predict_routine_rate, 8)
+        END,
+        xiaoshoufeiyong = CASE
+            WHEN COALESCE(t.pinzhongleixing, '') = '新特药' THEN ROUND(COALESCE(t.xiaoshoufeiyong, 0), 8)
+            ELSE ROUND(COALESCE(t.zs_lpz_fy, 0) + (r.income_087115 * r.predict_routine_rate), 8)
+        END,
+        shuijinjifujia = ROUND(r.income_087115 * r.predict_tax_rate, 8),
+        guanlifeiyong = ROUND(r.income_087115 * r.predict_mgmt_rate, 8),
+        yanfafeiyong = ROUND(r.income_087115 * r.predict_rd_rate, 8),
+        caiwufeiyong = ROUND(r.income_087115 * r.predict_fin_rate, 8),
+        yucelixingfeiyonglv = CASE
+            WHEN COALESCE(t.pinzhongleixing, '') = '新特药' THEN ROUND(COALESCE(t.yucelixingfeiyonglv, 0), 8)
+            ELSE ROUND(r.predict_routine_rate, 8)
+        END,
+        yuceshuijinlv = ROUND(r.predict_tax_rate, 8),
+        yuceguanlilv = ROUND(r.predict_mgmt_rate, 8),
+        yuceyanfalv = ROUND(r.predict_rd_rate, 8),
+        yucecaiwulv = ROUND(r.predict_fin_rate, 8),
+        tianruncpzhanbi = ROUND(r.agri_rate, 8)
+    FROM temp_recalc r
+    WHERE t.id = r.id;
+    RAISE NOTICE 'cost and fee recalculation finished';
+
+    UPDATE public.mis_auto_jyycmx
+    SET lirun = ROUND(
+            COALESCE(wushuijinezonge, 0)
+            - COALESCE(zhuyingyewuchengben, 0)
+            - COALESCE(xiaoshoufeiyong, 0)
+            - COALESCE(shuijinjifujia, 0)
+            - COALESCE(guanlifeiyong, 0)
+            - COALESCE(yanfafeiyong, 0)
+            - COALESCE(caiwufeiyong, 0),
+            8
+        )
+    WHERE hesuanqijian = v_cperiod
+      AND COALESCE(pinzhongleixing, '') IN ('普药非新特药', '新特药');
+    RAISE NOTICE 'profit finalized';
+
+    DROP TABLE IF EXISTS temp_final_src;
+    CREATE TEMP TABLE temp_final_src AS
+    WITH batch_totals AS (
+        SELECT
+            pinzhongleixing,
+            SUM(COALESCE(jianshu, 0)) AS total_pieces,
+            MAX(COALESCE(zongyunfei, 0)) AS total_freight
+        FROM public.mis_auto_jyycmx
+        WHERE hesuanqijian = v_cperiod
+          AND COALESCE(pinzhongleixing, '') IN ('普药非新特药', '新特药')
+        GROUP BY pinzhongleixing
+    )
+    SELECT
+        t.*,
+        ROUND(COALESCE(t.kuaqiwushuitiaozheng, 0), 8) AS kq_pz_yb_sr,
+        ROUND(COALESCE(t.wushuijinezonge, 0), 8) AS income_restore_no_tax,
+        ROUND(COALESCE(t.dijiajine, 0) / 1.13, 8) AS base_income_no_tax,
+        ROUND(COALESCE(t.dq_pz, 0) + COALESCE(t.fdq_pz_hj, 0) + COALESCE(t.fdq_pz_bcdq_hj, 0), 8) AS total_discount_tax,
+        ROUND(COALESCE(t.sw_lpz_sr, 0) + COALESCE(t.dq_pz_bhs, 0), 8) AS current_high_open_income,
+        ROUND(COALESCE(t.wushuijinezonge, 0) - (COALESCE(t.dijiajine, 0) / 1.13), 8) AS total_high_open_income,
+        ROUND(COALESCE(t.wushuijinezonge, 0) * 1.13, 8) AS final_tax_amount,
+        ROUND(COALESCE(b.total_pieces, 0), 8) AS total_pieces,
+        ROUND(COALESCE(b.total_freight, 0), 8) AS total_freight
+    FROM public.mis_auto_jyycmx t
+    LEFT JOIN batch_totals b
+        ON b.pinzhongleixing = t.pinzhongleixing
+    WHERE t.hesuanqijian = v_cperiod
+      AND COALESCE(t.pinzhongleixing, '') IN ('普药非新特药', '新特药');
+
+    UPDATE public.mis_auto_jyycmx j
+    SET hesuanqijian = v_cperiod,
+        fapiaoqijian = f.fapiaoqijian,
+        chukudanjuriqi = f.chukudanjuriqi,
+        jinshuipiaohao = f.jinshuipiaohao,
+        csaleinvoiceid1 = f.csaleinvoiceid1,
+        jinshuikaipiaoriqi = f.jinshuikaipiaoriqi,
+        shijichukuriqi = f.shijichukuriqi,
+        kaipiaokehu = f.kaipiaokehu,
+        xiaoshoubumen = f.xiaoshoubumen,
+        xiaoshoubumenduiyingdiqu = f.xiaoshoubumenduiyingdiqu,
+        xiaoshouyewuyuan = f.xiaoshouyewuyuan,
+        xiaoshouqudao = f.xiaoshouqudao,
+        qudaoyewuyuan = f.qudaoyewuyuan,
+        diqufenlei = f.diqufenlei,
+        shengshiqu = f.shengshiqu,
+        yetai = f.yetai,
+        pinzhongleixing = '普药非新特药',
+        pinzhong = COALESCE(f.pinzhong, f.wuliaomingcheng),
+        pingzhenghao = f.pingzhenghao,
+        wuliaobianma = f.wuliaobianma,
+        wuliaomingcheng = f.wuliaomingcheng,
+        guige = f.guige,
+        zhushuliang = ROUND(COALESCE(f.zhushuliang, 0), 8),
+        jianshu = ROUND(COALESCE(f.jianshu, 0), 8),
+        zhuhanshuidanjia = ROUND(COALESCE(f.zhuhanshuidanjia, 0), 8),
+        zhuhanshuijingjia = ROUND(COALESCE(f.zhuhanshuijingjia, 0), 8),
+        wushuijineheji = ROUND(COALESCE(f.wushuijineheji, 0), 8),
+        kuaqiwushuitiaozheng = ROUND(COALESCE(f.kq_pz_yb_sr, 0), 8),
+        wushuijinezonge = ROUND(COALESCE(f.income_restore_no_tax, 0), 8),
+        jiashuiheji = ROUND(COALESCE(f.jiashuiheji, 0), 8),
+        feiyongchongdijine = ROUND(COALESCE(f.feiyongchongdijine, 0), 8),
+        chongdiqianjine = ROUND(COALESCE(f.chongdiqianjine, 0), 8),
+        zhekoue = ROUND(COALESCE(f.zhekoue, 0), 8),
+        piaozheleixing = CAST('' AS VARCHAR),
+        danweidijia = ROUND(COALESCE(f.danweidijia, 0), 8),
+        dijiajine = ROUND(COALESCE(f.dijiajine, 0), 8),
+        dijiazhekou = CAST(0 AS DECIMAL(18,8)),
+        shijidijiajine = ROUND(COALESCE(f.dijiajine, 0), 8),
+        dijiashouru = f.base_income_no_tax,
+        kuaqidijiatiaozheng = CAST(0 AS DECIMAL(18,8)),
+        dijiashouruheji = f.base_income_no_tax,
+        gaokaijine = ROUND(COALESCE(f.final_tax_amount, 0) - COALESCE(f.dijiajine, 0), 8),
+        gaokaishouru = f.current_high_open_income,
+        gaokaizhekou = f.total_discount_tax,
+        huanyuangaokaizhekouhoudegaokaishouru = ROUND(f.current_high_open_income + (COALESCE(f.total_discount_tax, 0) / 1.13), 8),
+        kuaqigaokaitiaozheng = ROUND(COALESCE(f.total_high_open_income, 0) - COALESCE(f.current_high_open_income, 0), 8),
+        gaokaishouruheji = f.total_high_open_income,
+        jiashuiheji_huanyuangaokaizhekou = f.final_tax_amount,
+        zhekouheji = f.total_discount_tax,
+        jisuanliangpiaozhifeiyong = ROUND(COALESCE(f.zs_lpz_fy, 0), 8),
+        zhangshangliangpiaozhifeiyongzonge = CAST(0 AS DECIMAL(18,8)),
+        zhangshangliangpiaozhifeiyong = CAST(0 AS DECIMAL(18,8)),
+        xiaoshoushouru = ROUND(COALESCE(f.income_restore_no_tax, 0), 8),
+        xiaoshoujine = f.final_tax_amount,
+        fachushangpinchengben = ROUND(COALESCE(f.fachushangpinchengben, 0), 8),
+        fachushangpindaifangdanjia = ROUND(COALESCE(f.fachushangpindaifangdanjia, 0), 8),
+        leijifapiaozongshuliang = ROUND(COALESCE(f.leijifapiaozongshuliang, 0), 8),
+        leijidaifangzonge = ROUND(COALESCE(f.leijidaifangzonge, 0), 8),
+        zongjianshu = ROUND(COALESCE(f.total_pieces, 0), 8),
+        zongyunfei = ROUND(COALESCE(f.total_freight, 0), 8),
+        yunfei = ROUND(COALESCE(f.yunfei, 0), 8),
+        zhuyingyewuchengben = ROUND(COALESCE(f.zhuyingyewuchengben, 0), 8),
+        lixingfeiyongheji = ROUND(COALESCE(f.lixingfeiyongheji, 0), 8),
+        xiaoshoufeiyong = ROUND(COALESCE(f.xiaoshoufeiyong, 0), 8),
+        shuijinjifujia = ROUND(COALESCE(f.shuijinjifujia, 0), 8),
+        guanlifeiyong = ROUND(COALESCE(f.guanlifeiyong, 0), 8),
+        yanfafeiyong = ROUND(COALESCE(f.yanfafeiyong, 0), 8),
+        caiwufeiyong = ROUND(COALESCE(f.caiwufeiyong, 0), 8),
+        lirun = ROUND(COALESCE(f.lirun, 0), 8),
+        dijiashouru087115 = ROUND(COALESCE(f.dijiashouru087115, 0), 8),
+        tianruncpzhanbi = ROUND(COALESCE(f.tianruncpzhanbi, 0), 8),
+        ncpkouchujishu = ROUND(COALESCE(f.ncpkouchujishu, 0), 8),
+        ncpjiajikouchu = ROUND(COALESCE(f.ncpjiajikouchu, 0), 8),
+        yucelixingfeiyonglv = ROUND(COALESCE(f.yucelixingfeiyonglv, 0), 8),
+        yuceshuijinlv = ROUND(COALESCE(f.yuceshuijinlv, 0), 8),
+        yuceguanlilv = ROUND(COALESCE(f.yuceguanlilv, 0), 8),
+        yuceyanfalv = ROUND(COALESCE(f.yuceyanfalv, 0), 8),
+        yucecaiwulv = ROUND(COALESCE(f.yucecaiwulv, 0), 8),
+        create_time = NOW(),
+        istatus = 0
+    FROM temp_final_src f
+    WHERE j.hesuanqijian = v_cperiod
+      AND j.srcid = CAST(f.srcid AS VARCHAR)
+      AND COALESCE(f.pinzhongleixing, '') = '普药非新特药';
+    RAISE NOTICE 'general rows updated';
+
+    UPDATE public.mis_auto_jyycmx j
+    SET kuaqiwushuitiaozheng = ROUND(COALESCE(f.kq_pz_yb_sr, 0), 8),
+        wushuijinezonge = ROUND(COALESCE(f.income_restore_no_tax, 0), 8),
+        gaokaijine = ROUND(COALESCE(f.final_tax_amount, 0) - COALESCE(f.dijiajine, 0), 8),
+        gaokaishouru = ROUND(COALESCE(f.current_high_open_income, 0), 8),
+        gaokaizhekou = ROUND(COALESCE(f.total_discount_tax, 0), 8),
+        huanyuangaokaizhekouhoudegaokaishouru = ROUND(COALESCE(f.current_high_open_income, 0) + (COALESCE(f.total_discount_tax, 0) / 1.13), 8),
+        kuaqigaokaitiaozheng = ROUND(COALESCE(f.total_high_open_income, 0) - COALESCE(f.current_high_open_income, 0), 8),
+        gaokaishouruheji = ROUND(COALESCE(f.total_high_open_income, 0), 8),
+        jiashuiheji_huanyuangaokaizhekou = ROUND(COALESCE(f.final_tax_amount, 0), 8),
+        zhekouheji = ROUND(COALESCE(f.total_discount_tax, 0), 8),
+        xiaoshoushouru = ROUND(COALESCE(f.income_restore_no_tax, 0), 8),
+        xiaoshoujine = ROUND(COALESCE(f.final_tax_amount, 0), 8),
+        fachushangpinchengben = ROUND(COALESCE(f.fachushangpinchengben, 0), 8),
+        fachushangpindaifangdanjia = ROUND(COALESCE(f.fachushangpindaifangdanjia, 0), 8),
+        leijifapiaozongshuliang = ROUND(COALESCE(f.leijifapiaozongshuliang, 0), 8),
+        leijidaifangzonge = ROUND(COALESCE(f.leijidaifangzonge, 0), 8),
+        zongjianshu = ROUND(COALESCE(f.total_pieces, 0), 8),
+        zongyunfei = ROUND(COALESCE(f.total_freight, 0), 8),
+        yunfei = ROUND(COALESCE(f.yunfei, 0), 8),
+        zhuyingyewuchengben = ROUND(COALESCE(f.zhuyingyewuchengben, 0), 8),
+        shuijinjifujia = ROUND(COALESCE(f.shuijinjifujia, 0), 8),
+        guanlifeiyong = ROUND(COALESCE(f.guanlifeiyong, 0), 8),
+        yanfafeiyong = ROUND(COALESCE(f.yanfafeiyong, 0), 8),
+        caiwufeiyong = ROUND(COALESCE(f.caiwufeiyong, 0), 8),
+        lirun = ROUND(COALESCE(f.lirun, 0), 8),
+        dijiashouru087115 = ROUND(COALESCE(f.dijiashouru087115, 0), 8),
+        tianruncpzhanbi = ROUND(COALESCE(f.tianruncpzhanbi, 0), 8),
+        ncpkouchujishu = ROUND(COALESCE(f.ncpkouchujishu, 0), 8),
+        ncpjiajikouchu = ROUND(COALESCE(f.ncpjiajikouchu, 0), 8),
+        yuceshuijinlv = ROUND(COALESCE(f.yuceshuijinlv, 0), 8),
+        yuceguanlilv = ROUND(COALESCE(f.yuceguanlilv, 0), 8),
+        yuceyanfalv = ROUND(COALESCE(f.yuceyanfalv, 0), 8),
+        yucecaiwulv = ROUND(COALESCE(f.yucecaiwulv, 0), 8),
+        create_time = NOW()
+    FROM temp_final_src f
+    WHERE j.hesuanqijian = v_cperiod
+      AND j.srcid = CAST(f.srcid AS VARCHAR)
+      AND COALESCE(j.pinzhongleixing, '') = '新特药'
+      AND COALESCE(f.pinzhongleixing, '') = '新特药';
+    RAISE NOTICE 'specialty rows updated';
+
+    result := 1;
+    msg := CONCAT('Execution succeeded. Range: ', v_start_date, ' to ', v_yesterday);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        result := 0;
+        msg := SQLERRM;
+        RAISE NOTICE 'Procedure error: %', msg;
+END;
+$BODY$
+LANGUAGE plpgsql;
+
+

@@ -1,0 +1,267 @@
+CREATE OR REPLACE PROCEDURE "public"."Cost_Data_Cost_Sales_Specialty_Jyyc"(IN "p_target_date" varchar, INOUT "result" int4, INOUT "msg" text)
+ AS $BODY$
+DECLARE
+    v_yesterday VARCHAR(10);         -- 昨天的日期 (如 '2025-02-19')
+    v_cperiod VARCHAR(7);            -- 昨天所属期间 (如 '2025-02')
+    v_start_date VARCHAR(10);        -- 昨天所属月份的1号 (如 '2025-02-01')
+    v_last_month_period VARCHAR(7);  -- 上月期间 (如 '2025-01')
+    v_rule_count INT;
+    v_qiivc_join_type TEXT;
+    v_qiivc_on_condition TEXT;
+    v_qiivc_sub_on_condition TEXT;
+    v_qiivc_main_on_condition TEXT;
+    v_sql TEXT;
+BEGIN
+    -- ==========================================
+    -- 1. 时间参数自动推导 (核心修改区)
+    -- ==========================================
+    -- 传入今天,减去 1 天,自动算出“昨天”
+    v_yesterday := TO_CHAR(CAST(p_target_date AS DATE) - INTERVAL '1 day', 'YYYY-MM-DD');
+    
+    -- 根据“昨天”来推导期间和1号 (完美解决月初1号跑上月最后一天数据的跨月问题)
+    v_cperiod := SUBSTRING(v_yesterday, 1, 7);
+    v_start_date := CONCAT(v_cperiod, '-01');
+    v_last_month_period := TO_CHAR(CAST(v_start_date AS DATE) - INTERVAL '1 month', 'YYYY-MM');
+
+    -- 2. 清理当月1号到昨天的预测数据,保证重跑时不重复
+    DELETE FROM mis_auto_jyycmx 
+    WHERE chukudanjuriqi >= v_start_date
+      AND chukudanjuriqi <= v_yesterday
+      AND pinzhongleixing = '新特药';
+
+    -- 3. 读取单位底价动态匹配规则
+    SELECT COUNT(*)
+    INTO v_rule_count
+    FROM mis_auto_odwmt_sub_danweidijia d
+    INNER JOIN mis_auto_odwmt m ON d.masid = m.id
+    WHERE COALESCE(m.status::TEXT, '0') = '1'
+      AND COALESCE(d."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+      AND d.kaishiqijian <= v_cperiod
+      AND (NULLIF(d.jieshuqijian, '') IS NULL OR d.jieshuqijian >= v_cperiod);
+
+    IF v_rule_count = 0 THEN
+        RAISE EXCEPTION '未找到单位底价匹配规则，期间: %', v_cperiod;
+    END IF;
+
+    SELECT
+        MAX(NULLIF(TRIM(d.lianjiefangshi), '')),
+        string_agg(
+            CONCAT(d.zuobiaodashi, ' ', COALESCE(NULLIF(TRIM(d.caozuofu), ''), '='), ' ', d.youbiaodashi),
+            E'\n                   AND '
+            ORDER BY COALESCE(NULLIF(d.paixuhao::TEXT, ''), '0')::INT
+        )
+    INTO v_qiivc_join_type, v_qiivc_on_condition
+    FROM mis_auto_odwmt_sub_danweidijia d
+    INNER JOIN mis_auto_odwmt m ON d.masid = m.id
+    WHERE COALESCE(m.status::TEXT, '0') = '1'
+      AND COALESCE(d."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+      AND d.kaishiqijian <= v_cperiod
+      AND (NULLIF(d.jieshuqijian, '') IS NULL OR d.jieshuqijian >= v_cperiod);
+
+    IF NULLIF(TRIM(COALESCE(v_qiivc_on_condition, '')), '') IS NULL THEN
+        RAISE EXCEPTION '单位底价匹配规则没有有效条件，期间: %', v_cperiod;
+    END IF;
+
+    SELECT string_agg(
+        CONCAT(d.zuobiaodashi, ' ', COALESCE(NULLIF(TRIM(d.caozuofu), ''), '='), ' ', d.youbiaodashi),
+        E'\n                   AND '
+        ORDER BY COALESCE(NULLIF(d.paixuhao::TEXT, ''), '0')::INT
+    )
+    INTO v_qiivc_sub_on_condition
+    FROM mis_auto_odwmt_sub_danweidijia d
+    INNER JOIN mis_auto_odwmt m ON d.masid = m.id
+    WHERE COALESCE(m.status::TEXT, '0') = '1'
+      AND COALESCE(d."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+      AND d.kaishiqijian <= v_cperiod
+      AND (NULLIF(d.jieshuqijian, '') IS NULL OR d.jieshuqijian >= v_cperiod)
+      AND POSITION('d.' IN d.youbiaodashi) > 0;
+
+    SELECT string_agg(
+        CONCAT(d.zuobiaodashi, ' ', COALESCE(NULLIF(TRIM(d.caozuofu), ''), '='), ' ', d.youbiaodashi),
+        E'\n                   AND '
+        ORDER BY COALESCE(NULLIF(d.paixuhao::TEXT, ''), '0')::INT
+    )
+    INTO v_qiivc_main_on_condition
+    FROM mis_auto_odwmt_sub_danweidijia d
+    INNER JOIN mis_auto_odwmt m ON d.masid = m.id
+    WHERE COALESCE(m.status::TEXT, '0') = '1'
+      AND COALESCE(d."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+      AND d.kaishiqijian <= v_cperiod
+      AND (NULLIF(d.jieshuqijian, '') IS NULL OR d.jieshuqijian >= v_cperiod)
+      AND POSITION('m.' IN d.youbiaodashi) > 0;
+
+    IF NULLIF(TRIM(COALESCE(v_qiivc_sub_on_condition, '')), '') IS NULL THEN
+        RAISE EXCEPTION '单位底价匹配规则缺少子表 d 的匹配条件，期间: %', v_cperiod;
+    END IF;
+
+    IF FALSE AND NULLIF(TRIM(COALESCE(v_qiivc_main_on_condition, '')), '') IS NULL THEN
+        RAISE EXCEPTION '单位底价匹配规则缺少主表 m 的匹配条件，期间: %', v_cperiod;
+    END IF;
+
+    v_qiivc_join_type := CASE UPPER(TRIM(COALESCE(v_qiivc_join_type, 'LEFT JOIN')))
+        WHEN 'INNER' THEN 'INNER JOIN'
+        WHEN 'LEFT' THEN 'LEFT JOIN'
+        ELSE UPPER(TRIM(COALESCE(v_qiivc_join_type, 'LEFT JOIN')))
+    END;
+
+    IF v_qiivc_join_type NOT IN ('INNER JOIN', 'LEFT JOIN') THEN
+        RAISE EXCEPTION '单位底价连接方式不支持: %, 期间: %', v_qiivc_join_type, v_cperiod;
+    END IF;
+
+    -- 4. 核心经营预测插入 (后面使用 v_yesterday 代替原来的 p_target_date)
+    v_qiivc_on_condition := REPLACE(v_qiivc_on_condition, 's1.', 's.');
+    v_qiivc_sub_on_condition := REPLACE(v_qiivc_sub_on_condition, 's1.', 's.');
+    v_qiivc_main_on_condition := REPLACE(v_qiivc_main_on_condition, 's1.', 's.');
+    v_qiivc_main_on_condition := regexp_replace(
+        v_qiivc_main_on_condition,
+        '\bs\.cperiod\b\s*=\s*\bm\.cperiod\b',
+        '1 = 1',
+        'gi'
+    );
+    v_qiivc_main_on_condition := regexp_replace(
+        v_qiivc_main_on_condition,
+        '\bm\.cperiod\b\s*=\s*\bs\.cperiod\b',
+        '1 = 1',
+        'gi'
+    );
+    v_qiivc_sub_on_condition := regexp_replace(
+        v_qiivc_sub_on_condition,
+        '\bs\.norigtaxnetprice\b\s*=\s*\bd\.zhuhanshuijingjia\b',
+        '1 = 1',
+        'gi'
+    );
+    v_qiivc_sub_on_condition := regexp_replace(
+        v_qiivc_sub_on_condition,
+        '\bd\.zhuhanshuijingjia\b\s*=\s*\bs\.norigtaxnetprice\b',
+        '1 = 1',
+        'gi'
+    );
+    IF NULLIF(TRIM(COALESCE(v_qiivc_main_on_condition, '')), '') IS NULL THEN
+        v_qiivc_main_on_condition := '1 = 1';
+    END IF;
+
+    v_sql := format($SQL$
+    INSERT INTO mis_auto_jyycmx (
+        srcid, hesuanqijian, chukudanjuriqi, jinshuipiaohao, csaleinvoiceid1, 
+        jinshuikaipiaoriqi, shijichukuriqi, kaipiaokehu, xiaoshoubumen, xiaoshouyewuyuan, 
+        xiaoshouqudao, qudaoyewuyuan, diqufenlei, shengshiqu, yetai, 
+        pinzhongleixing, pingzhenghao, wuliaobianma, wuliaomingcheng, guige, 
+        zhushuliang, jianshu, zhuhanshuidanjia, zhuhanshuijingjia, wushuijineheji, 
+        jiashuiheji, feiyongchongdijine, chongdiqianjine, zhekoue,
+        danweidijia, dijiajine, dijiashouru, gaokaijine, gaokaishouru,
+        jisuanliangpiaozhifeiyong, yucelixingfeiyonglv, lixingfeiyongheji,
+        xiaoshoufeiyong, create_time, istatus
+    )
+    WITH
+        CTE_Unit_Agg AS ( SELECT pk_material, MAX(measrate) AS measrate FROM mis_auto_tbdua GROUP BY pk_material ),
+        CTE_Base_Invoice_Raw AS (
+            SELECT
+                p.id AS srcid, ROW_NUMBER() OVER (ORDER BY p.vdef__1, p.material_code, COALESCE(p.num,''), p.nnum, p.id) AS base_rn,
+                p.vdef__1, p.csaleinvoiceid1, p.vdef__2, p.vdef__3, p.name_2, p.name_5, p.name_6, p.sales_channel, p.saleschannelsalesman, p.area_class, p.num, p.vdef__5, p.material_code, p.material_name, p.material_spec, p.firstvbillcode, p.vsrccode1, p.vbatchcode1, CAST(p.nnum AS DECIMAL(18,8)) AS nnum, p.cmaterialvid, p.cperiod, p.dbilldate, 
+                CAST(p.nnum AS DECIMAL(18,8)) / NULLIF(CAST(split_part(u.measrate, '/', 1) AS DECIMAL(18,8)), 0) AS pieces, CAST(p.norigtaxprice1 AS DECIMAL(18,8)) AS norigtaxprice1, CAST(p.norigtaxnetprice AS DECIMAL(18,8)) AS norigtaxnetprice,
+                CAST(p.norigmny1 AS DECIMAL(18,8)) AS norigmny1,
+                CAST(p.norigtaxmny AS DECIMAL(18,8)) AS norigtaxmny,
+                CAST(p.norigtaxmny AS DECIMAL(18,8)) AS ptpcr_norigtaxmny,
+                CAST(p.norigsubmny1 AS DECIMAL(18,8)) AS norigsubmny1,
+                CAST(p.norigdiscount1 AS DECIMAL(18,8)) AS norigdiscount1,
+                p.area_name2
+            FROM mis_auto_ptpcr p
+            LEFT JOIN CTE_Unit_Agg u ON p.cmaterialvid = u.pk_material
+            WHERE p.dbilldate >= $1 AND p.dbilldate <= $2 AND p.cperiod = $3
+        ),
+        CTE_Base_Invoice AS (
+            SELECT b.*
+            FROM CTE_Base_Invoice_Raw b
+        ),
+        CTE_Predict_Expense_Rate AS (
+            SELECT
+                CASE WHEN SUM(dijiashouru) > 0 THEN SUM(lixingfeiyongheji) / SUM(dijiashouru) ELSE 0 END AS predict_expense_rate
+            FROM mis_auto_xinteyao_lirun_mingxi WHERE hesuanqijian = $4 AND guige != 'XTY99'
+        ),
+        CTE_Source_Rows AS (
+            SELECT srcid, base_rn, vdef__1, csaleinvoiceid1, vdef__2, vdef__3, name_2, name_5, name_6, sales_channel, saleschannelsalesman, area_class, area_name2, num, vdef__5, material_code, material_name, material_spec, nnum, pieces, cmaterialvid, norigtaxprice1, norigtaxnetprice, norigmny1, norigtaxmny, ptpcr_norigtaxmny, norigsubmny1, norigdiscount1, cperiod, dbilldate FROM CTE_Base_Invoice
+        ),
+        CTE_Matched_Base_Price AS (
+            SELECT s.*, bp.base_price AS unit_base_price
+            FROM CTE_Source_Rows s
+            INNER JOIN LATERAL (
+                SELECT CAST(d.price AS DECIMAL(18,8)) AS base_price
+                FROM mis_auto_qiivc m
+                %s mis_auto_qiivc_sub_zhixingdijia d ON d.masid = m.id AND %s
+                    AND (
+                        NULLIF(TRIM(COALESCE(d.zhuhanshuijingjia::TEXT, '')), '') IS NULL
+                        OR CAST(d.zhuhanshuijingjia AS DECIMAL(18,8)) = CAST(s.norigtaxnetprice AS DECIMAL(18,8))
+                    )
+                    AND COALESCE(d.isVoid, 'f') IN ('f', '0')
+                WHERE %s
+                  AND m.cperiod = $4
+                  AND COALESCE(m.isVoid::TEXT, '0') = '0'
+                  AND COALESCE(m.status::TEXT, '0') = '1'
+                  AND d.id IS NOT NULL
+                ORDER BY m.id DESC, d.id DESC
+                LIMIT 1
+            ) bp ON TRUE
+        ),
+        CTE_Basic_Metrics AS (
+            SELECT
+                m.*,
+                COALESCE(m.unit_base_price, m.norigtaxnetprice, 0) AS 单位底价,
+                ROUND(m.nnum * COALESCE(m.unit_base_price, m.norigtaxnetprice, 0), 8) AS 底价金额,
+                ROUND((m.nnum * COALESCE(m.unit_base_price, m.norigtaxnetprice, 0)) / 1.13, 8) AS 底价收入,
+                ROUND(m.norigtaxmny - (m.nnum * COALESCE(m.unit_base_price, m.norigtaxnetprice, 0)), 8) AS 高开金额,
+                ROUND((m.norigtaxmny - (m.nnum * COALESCE(m.unit_base_price, m.norigtaxnetprice, 0))) / 1.13, 8) AS 高开收入,
+                per.predict_expense_rate AS 例行费用率,
+                CAST(COALESCE(m.norigmny1, 0) AS DECIMAL(18,8)) AS 无税金额合计
+            FROM CTE_Matched_Base_Price m
+            CROSS JOIN CTE_Predict_Expense_Rate per
+        ),
+        CTE_Final_Details AS (
+            SELECT
+                m.*,
+                ROUND(COALESCE(高开收入, 0) * 1.13 * 0.87115, 8) AS 计算两票制费用,
+                ROUND(COALESCE(底价收入, 0) * COALESCE(例行费用率, 0), 8) AS 例行费用合计,
+                ROUND(
+                    COALESCE(高开收入, 0) * 1.13 * 0.87115
+                    + COALESCE(底价收入, 0) * COALESCE(例行费用率, 0),
+                    8
+                ) AS 销售费用
+            FROM CTE_Basic_Metrics m
+        )
+    SELECT
+        srcid, cperiod, CAST(dbilldate AS VARCHAR(20)), 
+        vdef__1, csaleinvoiceid1, vdef__2, vdef__3, name_2, name_5, name_6,
+        sales_channel, saleschannelsalesman, area_class, area_name2, vdef__5, 
+        '新特药', num, material_code, material_name, material_spec,
+        CAST(nnum AS DECIMAL(18,2)), CAST(pieces AS DECIMAL(18,2)),
+        CAST(norigtaxprice1 AS DECIMAL(18,8)), CAST(norigtaxnetprice AS DECIMAL(18,8)),
+        CAST(无税金额合计 AS DECIMAL(18,8)), CAST(norigtaxmny AS DECIMAL(18,8)),
+        CAST(norigsubmny1 AS DECIMAL(18,8)), CAST((COALESCE(ptpcr_norigtaxmny, 0) + COALESCE(norigsubmny1, 0)) AS DECIMAL(18,8)),
+        CAST(norigdiscount1 AS DECIMAL(18,8)),
+        CAST(单位底价 AS DECIMAL(18,8)), CAST(底价金额 AS DECIMAL(18,8)),
+        CAST(底价收入 AS DECIMAL(18,8)),
+        CAST(高开金额 AS DECIMAL(18,8)), CAST(高开收入 AS DECIMAL(18,8)),
+        CAST(计算两票制费用 AS DECIMAL(18,8)),
+        CAST(例行费用率 AS DECIMAL(18,8)),
+        CAST(例行费用合计 AS DECIMAL(18,8)),
+        CAST(销售费用 AS DECIMAL(18,8)),
+        CURRENT_TIMESTAMP, 0
+    FROM CTE_Final_Details
+    WHERE dbilldate >= $1 AND dbilldate <= $2 -- 使用推导出的 v_yesterday
+      AND cperiod = $3;
+$SQL$,
+        v_qiivc_join_type,
+        v_qiivc_sub_on_condition,
+        v_qiivc_main_on_condition);
+
+    EXECUTE v_sql USING v_start_date, v_yesterday, v_cperiod, v_last_month_period;
+
+    result := 1;
+    msg := CONCAT('执行成功。自动测算区间：', v_start_date, ' 至 ', v_yesterday);
+    
+EXCEPTION WHEN OTHERS THEN
+    result := 0;
+    msg := SQLERRM;
+    RAISE NOTICE '发生错误: %', msg;
+END;
+$BODY$
+  LANGUAGE plpgsql

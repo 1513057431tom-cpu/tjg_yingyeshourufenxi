@@ -1,0 +1,130 @@
+﻿CREATE OR REPLACE PROCEDURE "public"."Cost_Data_Cost_Sales_Specialty_N_Columns"("p_cperiod" varchar)
+AS $BODY$
+DECLARE
+    v_year VARCHAR(4);
+    v_start_period VARCHAR(7);
+BEGIN
+    v_year := SUBSTRING(p_cperiod, 1, 4);
+    v_start_period := CONCAT(v_year, '-01');
+
+    DELETE FROM Cost_Sales_balance
+    WHERE cperiod = p_cperiod
+      AND drugstype = '新特药';
+
+    WITH total_base_income AS (
+        SELECT COALESCE(SUM(m.dijiashouru087115), 0) AS sum_base_income
+        FROM mis_auto_xinteyao_lirun_mingxi m
+        WHERE m.jisuanqijian = p_cperiod
+          AND m.hesuanqijian >= v_start_period
+          AND m.hesuanqijian <= p_cperiod
+          AND m.guige != 'XTY99'
+    ),
+    base_rows AS (
+        SELECT
+            m.srcid AS source_id,
+            s.pk_accasoa,
+            s.disname,
+            CASE
+                WHEN ABS(COALESCE(t.sum_base_income, 0)) > 1e-6 THEN LEAST(
+                    ROUND((COALESCE(sb.cresum, 0) / t.sum_base_income) * m.dijiashouru087115, 8),
+                    999999999999.999999
+                )
+                ELSE 0
+            END AS subject_balance,
+            p_cperiod AS cperiod,
+            '新特药' AS drugstype
+        FROM mis_auto_xinteyao_lirun_mingxi m
+        CROSS JOIN total_base_income t
+        CROSS JOIN (
+            SELECT sub.pk_accasoa, sub.disname
+            FROM mis_auto_teezi_sub_kemuxinxi sub
+            JOIN mis_auto_teezi main ON sub.masid = main.id
+            WHERE main.cperiod = p_cperiod
+              AND (sub."isVoid" = 'f' OR sub."isVoid" = '0' OR sub."isVoid" IS NULL)
+              AND REPLACE(REPLACE(sub.fieldname, ' ', ''), CHR(9), '') NOT IN (
+                  'xiaoshoufeiyong',
+                  'lixingfeiyongheji',
+                  'lirun'
+              )
+        ) s
+        LEFT JOIN (
+            SELECT
+                sb_inner.pk_accasoa,
+                SUM(sb_inner.cresum) AS cresum
+            FROM mis_auto_vdemf sb_inner
+            LEFT JOIN mis_auto_ajsmf a ON sb_inner.pk_accasoa = a.pk_accasoa
+            WHERE sb_inner.cperiod = p_cperiod
+              AND a.dispname LIKE '6601%'
+              AND sb_inner.pk_accasoa != '1001A11000000000GG0I'
+              AND sb_inner.docf1 = '1001A11000000004TG3Z'
+            GROUP BY sb_inner.pk_accasoa
+        ) sb ON s.pk_accasoa = sb.pk_accasoa
+        WHERE m.jisuanqijian = p_cperiod
+          AND m.hesuanqijian >= v_start_period
+          AND m.hesuanqijian <= p_cperiod
+          AND m.guige != 'XTY99'
+    )
+    INSERT INTO Cost_Sales_balance (source_id, pk_accasoa, dispname, subject_balance, cperiod, drugstype)
+    SELECT source_id, pk_accasoa, disname, subject_balance, cperiod, drugstype
+    FROM base_rows
+    UNION ALL
+    SELECT source_id, pk_accasoa, CONCAT(disname, '_公摊'), subject_balance, cperiod, drugstype
+    FROM base_rows
+    UNION ALL
+    SELECT source_id, pk_accasoa, '其他合计', subject_balance, cperiod, drugstype
+    FROM base_rows
+    WHERE pk_accasoa = '1001A11000000000GG0O';
+
+    CALL public.refresh_xinteyao_expense_pivot(p_cperiod);
+
+    WITH CTE_Expense_Total AS (
+        SELECT source_id, SUM(subject_balance) AS total_routine_fee
+        FROM Cost_Sales_balance
+        WHERE cperiod = p_cperiod
+          AND drugstype = '新特药'
+          AND dispname NOT LIKE '%_公摊'
+          AND dispname <> '其他合计'
+        GROUP BY source_id
+    ),
+    CTE_Final_Summary AS (
+        SELECT
+            m_inner.id,
+            COALESCE(t.total_routine_fee, 0) AS final_routine_fee
+        FROM mis_auto_xinteyao_lirun_mingxi m_inner
+        LEFT JOIN CTE_Expense_Total t ON m_inner.srcid = t.source_id
+        WHERE m_inner.jisuanqijian = p_cperiod
+          AND m_inner.hesuanqijian >= v_start_period
+          AND m_inner.hesuanqijian <= p_cperiod
+    )
+    UPDATE mis_auto_xinteyao_lirun_mingxi m
+    SET
+        lixingfeiyongheji = CASE
+            WHEN m.guige != 'XTY99' THEN a.final_routine_fee
+            ELSE 0
+        END,
+        xiaoshoufeiyong = CASE
+            WHEN m.guige != 'XTY99' THEN COALESCE(m.zhangshangliangpiaozhifeiyong, 0) + a.final_routine_fee
+            ELSE 0
+        END,
+        xiaoshoufeiyongjiezuan = CASE
+            WHEN m.guige != 'XTY99' THEN COALESCE(m.jisuanliangpiaozhifeiyong, 0) + a.final_routine_fee
+            ELSE 0
+        END,
+        lirun = CASE
+            WHEN m.guige != 'XTY99' THEN (
+                COALESCE(m.xiaoshoushouru, 0)
+                - (COALESCE(m.fachushangpinchengben, 0) + COALESCE(m.yunfei, 0))
+                - (COALESCE(m.zhangshangliangpiaozhifeiyong, 0) + a.final_routine_fee)
+                - COALESCE(m.shuijinjifujia, 0)
+                - COALESCE(m.yanfafeiyong, 0)
+            )
+            ELSE 0
+        END
+    FROM CTE_Final_Summary a
+    WHERE m.id = a.id
+      AND m.jisuanqijian = p_cperiod
+      AND m.hesuanqijian >= v_start_period
+      AND m.hesuanqijian <= p_cperiod;
+END;
+$BODY$
+LANGUAGE plpgsql;

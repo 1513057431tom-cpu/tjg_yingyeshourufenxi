@@ -1,0 +1,602 @@
+CREATE OR REPLACE PROCEDURE "public"."Cost_Data_Cost_Sales_Specialty_Drugs"(IN "s_cperiod" varchar, INOUT "result" int4, INOUT "msg" text)
+ AS $BODY$
+DECLARE
+    v_year VARCHAR(4);
+    v_start_period VARCHAR(7);
+    v_target_month INT;
+    v_curr_period VARCHAR(7);
+    i INT;
+    v_rule_count INT;
+    v_aromw_join_type TEXT;
+    v_aromw_on_condition TEXT;
+    v_aromw_partition_expr TEXT;
+    v_qiivc_join_type TEXT;
+    v_qiivc_on_condition TEXT;
+    v_qiivc_sub_on_condition TEXT;
+    v_qiivc_main_on_condition TEXT;
+    v_sql TEXT;
+BEGIN
+    -- ==========================================
+    -- 0. 解析出传入期间的年份和 1月份的起始期间
+    -- ==========================================
+    v_year := SUBSTRING(s_cperiod, 1, 4);
+    v_start_period := CONCAT(v_year, '-01');
+    v_target_month := CAST(SUBSTRING(s_cperiod, 6, 2) AS INT);
+    RAISE NOTICE 'v_start_period=%, s_cperiod=%', v_start_period, s_cperiod;
+
+    -- ==========================================
+    -- 1. 清理当前计算期间的旧快照；不删除其他计算期间的历史快照
+    -- ==========================================
+    DELETE FROM mis_auto_xinteyao_lirun_mingxi 
+    WHERE jisuanqijian = s_cperiod
+      AND hesuanqijian >= v_start_period AND hesuanqijian <= s_cperiod;
+
+    -- ==========================================
+    -- 2. 核心业务逻辑：逐月读取动态匹配规则并生成数据
+    -- ==========================================
+    FOR i IN 1..v_target_month LOOP
+        v_curr_period := CONCAT(v_year, '-', LPAD(i::TEXT, 2, '0'));
+        RAISE NOTICE '循环期间: %', v_curr_period;
+
+        -- 开票口径匹配规则
+        SELECT COUNT(*)
+        INTO v_rule_count
+        FROM mis_auto_odwmt_sub_kaipiaokoujing d
+        INNER JOIN mis_auto_odwmt m ON d.masid = m.id
+        WHERE COALESCE(m.status::TEXT, '0') = '1'
+          AND COALESCE(d."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+          AND d.kaishiqijian <= v_curr_period
+          AND (NULLIF(d.jieshuqijian, '') IS NULL OR d.jieshuqijian >= v_curr_period);
+
+        IF v_rule_count = 0 THEN
+            RAISE EXCEPTION '未找到开票口径匹配规则，期间: %', v_curr_period;
+        END IF;
+
+        SELECT
+            MAX(NULLIF(TRIM(d.lianjiefangshi), '')),
+            string_agg(
+                CASE
+                    WHEN COALESCE(NULLIF(TRIM(d.caozuofu), ''), '=') = '='
+                     AND (
+                            d.guizemingchen = '金税票号'
+                         OR POSITION('vdef__1' IN d.zuobiaodashi) > 0
+                         OR POSITION('jinshuipiaohao' IN d.youbiaodashi) > 0
+                     )
+                    THEN CONCAT('NULLIF(NULLIF(TRIM((', d.zuobiaodashi, ')::TEXT), ', quote_literal(''), '), ', quote_literal('~'), ') IS NOT DISTINCT FROM NULLIF(NULLIF(TRIM((', d.youbiaodashi, ')::TEXT), ', quote_literal(''), '), ', quote_literal('~'), ')')
+                    ELSE CONCAT(d.zuobiaodashi, ' ', COALESCE(NULLIF(TRIM(d.caozuofu), ''), '='), ' ', d.youbiaodashi)
+                END,
+                E'\n           AND '
+                ORDER BY COALESCE(NULLIF(d.paixuhao::TEXT, ''), '0')::INT
+            ),
+            string_agg(
+                CASE
+                    WHEN d.guizemingchen = '金税票号'
+                      OR POSITION('jinshuipiaohao' IN d.youbiaodashi) > 0
+                    THEN CONCAT('NULLIF(NULLIF(TRIM((', REPLACE(d.youbiaodashi, 'l.', 'l_src.'), ')::TEXT), ', quote_literal(''), '), ', quote_literal('~'), ')')
+                    ELSE REPLACE(d.youbiaodashi, 'l.', 'l_src.')
+                END,
+                ', '
+                ORDER BY COALESCE(NULLIF(d.paixuhao::TEXT, ''), '0')::INT
+            )
+        INTO v_aromw_join_type, v_aromw_on_condition, v_aromw_partition_expr
+        FROM mis_auto_odwmt_sub_kaipiaokoujing d
+        INNER JOIN mis_auto_odwmt m ON d.masid = m.id
+        WHERE COALESCE(m.status::TEXT, '0') = '1'
+          AND COALESCE(d."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+          AND d.kaishiqijian <= v_curr_period
+          AND (NULLIF(d.jieshuqijian, '') IS NULL OR d.jieshuqijian >= v_curr_period);
+
+        IF NULLIF(TRIM(COALESCE(v_aromw_on_condition, '')), '') IS NULL THEN
+            RAISE EXCEPTION '开票口径匹配规则没有有效条件，期间: %', v_curr_period;
+        END IF;
+
+        v_aromw_join_type := CASE UPPER(TRIM(COALESCE(v_aromw_join_type, 'INNER JOIN')))
+            WHEN 'INNER' THEN 'INNER JOIN'
+            WHEN 'LEFT' THEN 'LEFT JOIN'
+            ELSE UPPER(TRIM(COALESCE(v_aromw_join_type, 'INNER JOIN')))
+        END;
+
+        IF v_aromw_join_type NOT IN ('INNER JOIN', 'LEFT JOIN') THEN
+            RAISE EXCEPTION '开票口径连接方式不支持: %, 期间: %', v_aromw_join_type, v_curr_period;
+        END IF;
+
+        -- 单位底价匹配规则
+        SELECT COUNT(*)
+        INTO v_rule_count
+        FROM mis_auto_odwmt_sub_danweidijia d
+        INNER JOIN mis_auto_odwmt m ON d.masid = m.id
+        WHERE COALESCE(m.status::TEXT, '0') = '1'
+          AND COALESCE(d."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+          AND d.kaishiqijian <= v_curr_period
+          AND (NULLIF(d.jieshuqijian, '') IS NULL OR d.jieshuqijian >= v_curr_period);
+
+        IF v_rule_count = 0 THEN
+            RAISE EXCEPTION '未找到单位底价匹配规则，期间: %', v_curr_period;
+        END IF;
+
+        SELECT
+            MAX(NULLIF(TRIM(d.lianjiefangshi), '')),
+            string_agg(
+                CONCAT(d.zuobiaodashi, ' ', COALESCE(NULLIF(TRIM(d.caozuofu), ''), '='), ' ', d.youbiaodashi),
+                E'\n                   AND '
+                ORDER BY COALESCE(NULLIF(d.paixuhao::TEXT, ''), '0')::INT
+            )
+        INTO v_qiivc_join_type, v_qiivc_on_condition
+        FROM mis_auto_odwmt_sub_danweidijia d
+        INNER JOIN mis_auto_odwmt m ON d.masid = m.id
+        WHERE COALESCE(m.status::TEXT, '0') = '1'
+          AND COALESCE(d."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+          AND d.kaishiqijian <= v_curr_period
+          AND (NULLIF(d.jieshuqijian, '') IS NULL OR d.jieshuqijian >= v_curr_period);
+
+        IF NULLIF(TRIM(COALESCE(v_qiivc_on_condition, '')), '') IS NULL THEN
+            RAISE EXCEPTION '单位底价匹配规则没有有效条件，期间: %', v_curr_period;
+        END IF;
+
+        SELECT string_agg(
+            CONCAT(d.zuobiaodashi, ' ', COALESCE(NULLIF(TRIM(d.caozuofu), ''), '='), ' ', d.youbiaodashi),
+            E'\n                   AND '
+            ORDER BY COALESCE(NULLIF(d.paixuhao::TEXT, ''), '0')::INT
+        )
+        INTO v_qiivc_sub_on_condition
+        FROM mis_auto_odwmt_sub_danweidijia d
+        INNER JOIN mis_auto_odwmt m ON d.masid = m.id
+        WHERE COALESCE(m.status::TEXT, '0') = '1'
+          AND COALESCE(d."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+          AND d.kaishiqijian <= v_curr_period
+          AND (NULLIF(d.jieshuqijian, '') IS NULL OR d.jieshuqijian >= v_curr_period)
+          AND POSITION('d.' IN d.youbiaodashi) > 0;
+
+        SELECT string_agg(
+            CONCAT(d.zuobiaodashi, ' ', COALESCE(NULLIF(TRIM(d.caozuofu), ''), '='), ' ', d.youbiaodashi),
+            E'\n                   AND '
+            ORDER BY COALESCE(NULLIF(d.paixuhao::TEXT, ''), '0')::INT
+        )
+        INTO v_qiivc_main_on_condition
+        FROM mis_auto_odwmt_sub_danweidijia d
+        INNER JOIN mis_auto_odwmt m ON d.masid = m.id
+        WHERE COALESCE(m.status::TEXT, '0') = '1'
+          AND COALESCE(d."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+          AND d.kaishiqijian <= v_curr_period
+          AND (NULLIF(d.jieshuqijian, '') IS NULL OR d.jieshuqijian >= v_curr_period)
+          AND POSITION('m.' IN d.youbiaodashi) > 0;
+
+        IF NULLIF(TRIM(COALESCE(v_qiivc_sub_on_condition, '')), '') IS NULL THEN
+            RAISE EXCEPTION '单位底价匹配规则缺少子表 d 的匹配条件，期间: %', v_curr_period;
+        END IF;
+
+        IF NULLIF(TRIM(COALESCE(v_qiivc_main_on_condition, '')), '') IS NULL THEN
+            RAISE EXCEPTION '单位底价匹配规则缺少主表 m 的匹配条件，期间: %', v_curr_period;
+        END IF;
+
+        v_qiivc_join_type := CASE UPPER(TRIM(COALESCE(v_qiivc_join_type, 'LEFT JOIN')))
+            WHEN 'INNER' THEN 'INNER JOIN'
+            WHEN 'LEFT' THEN 'LEFT JOIN'
+            ELSE UPPER(TRIM(COALESCE(v_qiivc_join_type, 'LEFT JOIN')))
+        END;
+
+        IF v_qiivc_join_type NOT IN ('INNER JOIN', 'LEFT JOIN') THEN
+            RAISE EXCEPTION '单位底价连接方式不支持: %, 期间: %', v_qiivc_join_type, v_curr_period;
+        END IF;
+
+        v_sql := format($SQL$
+    INSERT INTO mis_auto_xinteyao_lirun_mingxi (
+         srcid, jisuanqijian, hesuanqijian, jinshuipiaohao, csaleinvoiceid1, jinshuikaipiaoriqi, shijichukuriqi, chukudanjuriqi, kaipiaokehu, -- 📌 新增 chukudanjuriqi
+         xiaoshoubumen, xiaoshouyewuyuan, xiaoshouqudao, qudaoyewuyuan, diqufenlei,
+         shengshiqu, yetai, pinzhongleixing,
+         pingzhenghao, wuliaobianma, wuliaomingcheng, guige,
+         zhushuliang, jianshu, zhuhanshuidanjia, zhuhanshuijingjia, wushuijineheji,
+         kuaqiwushuitiaozheng, wushuijinezonge,
+         jiashuiheji, feiyongchongdijine, chongdiqianjine, zhekoue, piaozheleixing,
+         danweidijia, dijiajine, dijiazhekou, shijidijiajine, dijiashouru,
+         kuaqidijiatiaozheng, dijiashouruheji,
+         gaokaijine, gaokaishouru, gaokaizhekou, huanyuangaokaizhekouhoudegaokaishouru,
+         kuaqigaokaitiaozheng, gaokaishouruheji,
+         jiashuiheji_huanyuangaokaizhekou, zhekouheji, jisuanliangpiaozhifeiyong,
+         zhangshangliangpiaozhifeiyongzonge, zhangshangliangpiaozhifeiyong, xiaoshoushouru, xiaoshoujine,
+         fachushangpinchengben, fachushangpindaifangdanjia,
+         leijifapiaozongshuliang, leijidaifangzonge,
+         zongjianshu, zongyunfei,
+         yunfei, zhuyingyewuchengben,
+         lixingfeiyongheji, xiaoshoufeiyong,
+         shuijinjifujiaheji, yanfafeiyongheji,
+         shuijinjifujia, yanfafeiyong,
+         lirun, dijiashouru087115,
+         xiaoshoudingdanhao, chukudanhao, picihao
+    )
+    WITH
+    CTE_Unit_Agg AS (
+        SELECT pk_material, MAX(measrate) AS measrate
+        FROM mis_auto_tbdua
+        GROUP BY pk_material
+    ),
+    CTE_Material_Mapping AS (
+        SELECT pk_source, MAX(code) AS code
+        FROM mis_auto_rbyld
+        GROUP BY pk_source
+    ),
+    CTE_NIYZT_Material_Code AS (
+        SELECT DISTINCT m.cperiod, d.cinvcode AS material_code
+        FROM mis_auto_niyzt m
+        INNER JOIN mis_auto_niyzt_sub_dijiamingxi d ON m.id = d.masid
+        WHERE COALESCE(m.isVoid, 0) = 0 AND COALESCE(d.isVoid, '0') IN ('0', 'f')
+    ),
+    CTE_NIYZT_Inventory_Exclude AS (
+        SELECT DISTINCT n.cperiod, r.pk_source AS cinventoryid
+        FROM CTE_NIYZT_Material_Code n
+        INNER JOIN mis_auto_rbyld r ON n.material_code = r.code
+    ),
+    CTE_Ledger_Target_Period AS (
+        SELECT MIN(m.cperiod) AS ledger_cperiod
+        FROM mis_auto_aromw m
+        WHERE LEFT(m.cperiod, 4) = LEFT($3, 4)
+          AND m.cperiod >= $3
+    ),
+    CTE_Ledger_Main AS (
+        SELECT m.*
+        FROM mis_auto_aromw m
+        INNER JOIN CTE_Ledger_Target_Period t ON m.cperiod = t.ledger_cperiod
+    ),
+    CTE_Ledger_Source AS (
+        SELECT *
+        FROM (
+            SELECT 
+                d.*,
+                m.cperiod AS ledger_cperiod,
+                m.nianfen AS ledger_nianfen,
+                m.yuefen AS ledger_yuefen,
+                CONCAT(
+                    SUBSTRING(CAST(COALESCE(d.nianfen, m.nianfen) AS TEXT) FROM '[0-9]+'),
+                    '-',
+                    LPAD(SUBSTRING(CAST(COALESCE(d.yuefen, m.yuefen) AS TEXT) FROM '[0-9]+'), 2, '0')
+                ) AS mapped_period
+            FROM CTE_Ledger_Main m
+            INNER JOIN mis_auto_aromw_sub_mingxi d ON d.masid = m.id
+            WHERE COALESCE(d."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+        ) ledger_source
+        WHERE mapped_period >= $1 AND mapped_period <= $2
+    ),
+    CTE_Ledger_Agg AS (
+        SELECT *
+        FROM (
+            SELECT 
+                l_src.*,
+                MAX(l_src.piaozheleixing) OVER (PARTITION BY %s) AS discount_type, 
+                SUM(COALESCE(l_src.dijiapiaozhejine, 0)) OVER (PARTITION BY %s) AS base_discount_val,
+                ROW_NUMBER() OVER (PARTITION BY %s ORDER BY l_src.nianfen, l_src.yuefen) AS rn
+            FROM CTE_Ledger_Source l_src
+        ) agg
+        WHERE rn = 1
+    ),
+    CTE_Base_Invoice_Raw AS (
+        SELECT
+            p.id AS srcid, 
+            ROW_NUMBER() OVER (ORDER BY p.vdef__1, p.material_code, COALESCE(p.num,''), p.nnum) AS base_rn,
+            p.vdef__1, p.csaleinvoiceid1, p.vdef__2, p.vdef__3, p.dbilldate1, p.name_2, p.name_5, p.name_6, -- 📌 新增 p.dbilldate1
+            p.sales_channel, p.saleschannelsalesman, p.area_class, p.num, p.vdef__5,
+            p.material_code, p.material_name, p.material_spec,
+            p.firstvbillcode, p.vsrccode1, p.vbatchcode1,
+            CAST(p.nnum AS DECIMAL(18,8)) AS nnum,
+            p.cmaterialvid, p.cperiod,
+            CAST(p.nnum AS DECIMAL(18,8)) / NULLIF(CAST(split_part(u.measrate, '/', 1) AS DECIMAL(18,8)), 0) AS pieces,
+            CAST(p.norigtaxprice1 AS DECIMAL(18,8)) AS norigtaxprice1,
+            CAST(p.norigtaxnetprice AS DECIMAL(18,8)) AS norigtaxnetprice,
+            
+            CASE WHEN l.discount_type IN ('底价票折', '两票制票折-底价票折', '底价票折-两票制票折') THEN ((CAST(p.nnum AS DECIMAL(18,8)) * CAST(p.norigtaxprice1 AS DECIMAL(18,8))) / 1.13) ELSE (CAST(p.norigtaxmny AS DECIMAL(18,8)) / 1.13) END AS norigmny1,
+            CASE WHEN l.discount_type IN ('底价票折', '两票制票折-底价票折', '底价票折-两票制票折') THEN (CAST(p.nnum AS DECIMAL(18,8)) * CAST(p.norigtaxprice1 AS DECIMAL(18,8))) ELSE CAST(p.norigtaxmny AS DECIMAL(18,8)) END AS norigtaxmny,
+            
+            CAST(p.norigtaxmny AS DECIMAL(18,8)) AS ptpcr_norigtaxmny,
+
+            CAST(p.norigsubmny1 AS DECIMAL(18,8)) AS norigsubmny1,
+            CAST(p.norigdiscount1 AS DECIMAL(18,8)) AS norigdiscount1,
+            p.area_name2, l.discount_type,
+            CAST(l.base_discount_val AS DECIMAL(18,8)) AS base_discount_val,
+            ROW_NUMBER() OVER (PARTITION BY p.vdef__1, p.name_2, p.material_code ORDER BY p.num) AS row_num,
+            ROW_NUMBER() OVER (PARTITION BY p.vdef__1, p.name_2, p.material_code, COALESCE(l.discount_type, '') ORDER BY p.num, p.id) AS discount_row_num
+        FROM mis_auto_ptpcr p
+        %s CTE_Ledger_Agg l 
+            ON %s
+        LEFT JOIN CTE_Unit_Agg u ON p.cmaterialvid = u.pk_material
+        WHERE p.cperiod >= $1 AND p.cperiod <= $2
+    ),
+    CTE_Base_Invoice AS (
+        SELECT
+            b.*,
+            SUM(COALESCE(b.norigsubmny1, 0)) OVER (
+                PARTITION BY b.cperiod, b.vdef__1, b.name_2, b.material_code, COALESCE(b.discount_type, '')
+            ) AS sum_norigsubmny1,
+            CASE
+                WHEN SUM(COALESCE(b.norigsubmny1, 0)) OVER (
+                    PARTITION BY b.cperiod, b.vdef__1, b.name_2, b.material_code, COALESCE(b.discount_type, '')
+                ) = 0 THEN 0
+                ELSE COALESCE(b.base_discount_val, 0) * (
+                    b.norigsubmny1 / SUM(COALESCE(b.norigsubmny1, 0)) OVER (
+                        PARTITION BY b.cperiod, b.vdef__1, b.name_2, b.material_code, COALESCE(b.discount_type, '')
+                    )
+                )
+            END AS allocated_base_discount
+        FROM CTE_Base_Invoice_Raw b
+    ),
+    CTE_Dynamic_Rate AS ( SELECT COALESCE(feiyonglv, 0) AS live_expense_rate FROM mis_auto_uwimv LIMIT 1 ),
+    CTE_Dynamic_Freight AS ( SELECT to_char(to_timestamp(huijiqijian), 'YYYY-MM') AS freight_period, SUM(COALESCE(chuyunbuyunfei, 0) + COALESCE(caiwubuyunfei, 0)) AS total_period_freight FROM mis_auto_hhgdx GROUP BY to_char(to_timestamp(huijiqijian), 'YYYY-MM') ),
+    
+    CTE_Financial_Model_Base AS (
+        SELECT p.cperiod, LEFT(p.cperiod, 4) AS cyear,
+               SUM(CASE WHEN c.accasoaname = '税金及附加' THEN CAST(COALESCE(c.cresum, '0') AS DECIMAL(18,8)) ELSE 0 END) AS period_total_tax,
+               SUM(CASE WHEN c.accasoaname = '研发费用' THEN CAST(COALESCE(c.cresum, '0') AS DECIMAL(18,8)) ELSE 0 END) AS period_total_rd,
+               ROW_NUMBER() OVER(PARTITION BY LEFT(p.cperiod, 4) ORDER BY p.cperiod DESC) AS rn
+        FROM mis_auto_sbumz p
+        INNER JOIN mis_auto_sbumz_sub_kemuxiangqing c ON p.id = c.masid
+        WHERE p.leixing = '新特药' AND COALESCE(p.isVoid, '0') = '0' AND COALESCE(c.isVoid, 'f') IN ('0', 'f')
+          AND p.cperiod >= $1 AND p.cperiod <= $2
+        GROUP BY p.cperiod
+    ),
+    -- 📌 修改2：得到每个年份最大月份对应的“税金及附加”和“研发费用”
+    CTE_Financial_Model AS (
+        SELECT cyear, period_total_tax, period_total_rd
+        FROM CTE_Financial_Model_Base
+        WHERE rn = 1
+    ),
+
+    CTE_Split_Rows AS (
+        -- 分支1(原始行)
+        SELECT srcid, base_rn, vdef__1, csaleinvoiceid1, vdef__2, vdef__3, dbilldate1, name_2, name_5, name_6, sales_channel, saleschannelsalesman, area_class, area_name2, num, vdef__5, material_code, material_name, material_spec, nnum, pieces, cmaterialvid, norigtaxprice1, norigtaxnetprice, norigmny1, norigtaxmny, ptpcr_norigtaxmny, norigsubmny1, norigdiscount1, discount_type, base_discount_val, cperiod, allocated_base_discount, discount_row_num, '原始行' AS row_type, firstvbillcode, vsrccode1, vbatchcode1 FROM CTE_Base_Invoice -- 📌 新增 dbilldate1
+        UNION ALL
+        -- 分支2(底价拆分行)：为了让 XTY99 相加依然是0,传 (-sum_norigsubmny1)
+        SELECT srcid, base_rn, vdef__1, csaleinvoiceid1, vdef__2, vdef__3, dbilldate1, name_2, name_5, name_6, sales_channel, saleschannelsalesman, area_class, area_name2, num, vdef__5, material_code, material_name, 'XTY99' AS material_spec, -1 AS nnum, 0 AS pieces, cmaterialvid, sum_norigsubmny1 AS norigtaxprice1, (sum_norigsubmny1 / 1.13) AS norigtaxnetprice, (-(sum_norigsubmny1 / 1.13)) AS norigmny1, (-sum_norigsubmny1) AS norigtaxmny, (-sum_norigsubmny1) AS ptpcr_norigtaxmny, sum_norigsubmny1 AS norigsubmny1, sum_norigsubmny1 AS norigdiscount1, '底价票折' AS discount_type, base_discount_val, cperiod, allocated_base_discount, discount_row_num, '底价拆分行' AS row_type, firstvbillcode, vsrccode1, vbatchcode1 FROM CTE_Base_Invoice WHERE discount_type = '底价票折' AND discount_row_num = 1 -- 📌 新增 dbilldate1
+        UNION ALL
+        -- 分支3(底价拆分行)：传 (-base_discount_val)
+        SELECT srcid, base_rn, vdef__1, csaleinvoiceid1, vdef__2, vdef__3, dbilldate1, name_2, name_5, name_6, sales_channel, saleschannelsalesman, area_class, area_name2, num, vdef__5, material_code, material_name, 'XTY99' AS material_spec, -1 AS nnum, 0 AS pieces, cmaterialvid, base_discount_val AS norigtaxprice1, (base_discount_val / 1.13) AS norigtaxnetprice, (-(base_discount_val / 1.13)) AS norigmny1, (-base_discount_val) AS norigtaxmny, (-base_discount_val) AS ptpcr_norigtaxmny, base_discount_val AS norigsubmny1, base_discount_val AS norigdiscount1, '底价票折' AS discount_type, base_discount_val, cperiod, allocated_base_discount, discount_row_num, '底价拆分行' AS row_type, firstvbillcode, vsrccode1, vbatchcode1 FROM CTE_Base_Invoice WHERE discount_type IN ('两票制票折-底价票折', '底价票折-两票制票折') AND discount_row_num = 1 -- 📌 新增 dbilldate1
+        UNION ALL
+        -- 分支4(两票拆分行)：传 (-(sum_norigsubmny1 - base_discount_val))
+        SELECT srcid, base_rn, vdef__1, csaleinvoiceid1, vdef__2, vdef__3, dbilldate1, name_2, name_5, name_6, sales_channel, saleschannelsalesman, area_class, area_name2, num, vdef__5, material_code, material_name, 'XTY99' AS material_spec, -1 AS nnum, 0 AS pieces, cmaterialvid, (sum_norigsubmny1 - base_discount_val) AS norigtaxprice1, ((sum_norigsubmny1 - base_discount_val) / 1.13) AS norigtaxnetprice, (-((sum_norigsubmny1 - base_discount_val) / 1.13)) AS norigmny1, (-(sum_norigsubmny1 - base_discount_val)) AS norigtaxmny, (-(sum_norigsubmny1 - base_discount_val)) AS ptpcr_norigtaxmny, (sum_norigsubmny1 - base_discount_val) AS norigsubmny1, (sum_norigsubmny1 - base_discount_val) AS norigdiscount1, '两票制票折' AS discount_type, base_discount_val, cperiod, allocated_base_discount, discount_row_num, '两票拆分行' AS row_type, firstvbillcode, vsrccode1, vbatchcode1 FROM CTE_Base_Invoice WHERE discount_type IN ('两票制票折-底价票折', '底价票折-两票制票折') AND discount_row_num = 1 -- 📌 新增 dbilldate1
+    ),
+    CTE_Matched_Base_Price AS (
+        SELECT s.*, bp.base_price AS unit_base_price,
+               MAX(CASE WHEN s.row_type = '原始行' THEN bp.base_price ELSE 0 END) OVER (PARTITION BY s.vdef__1, s.num, s.material_code) AS family_base_price
+        FROM CTE_Split_Rows s
+        LEFT JOIN (
+            SELECT s1.vdef__1, s1.material_code, s1.row_type, s1.num, CAST(d.price AS DECIMAL(18,8)) AS base_price,
+                   ROW_NUMBER() OVER (PARTITION BY s1.vdef__1, s1.material_code, s1.row_type, s1.num ORDER BY m.id DESC, d.id DESC) AS rn
+            FROM CTE_Split_Rows s1
+            %s mis_auto_qiivc m ON %s AND COALESCE(m.isVoid::TEXT, '0') = '0' AND COALESCE(m.status::TEXT, '0') = '1'
+            %s mis_auto_qiivc_sub_zhixingdijia d ON d.masid = m.id AND %s AND COALESCE(d.isVoid, 'f') IN ('f', '0')
+        ) bp ON s.vdef__1 = bp.vdef__1 AND s.material_code = bp.material_code AND s.row_type = bp.row_type AND s.num = bp.num AND bp.rn = 1
+    ),
+    CTE_Material_Periods AS (
+        SELECT DISTINCT cperiod, material_code FROM mis_auto_ptpcr WHERE cperiod >= $1 AND cperiod <= $2
+        UNION SELECT DISTINCT s.cperiod, r.code FROM mis_auto_sosgv s INNER JOIN CTE_Material_Mapping r ON s.cinventoryid = r.pk_source WHERE s.PK_MARBASCLASS IS NOT NULL AND s.cperiod >= $1 AND s.cperiod <= $2
+    ),
+    CTE_Monthly_Credit AS (
+        SELECT s.cperiod, r.code AS material_code, SUM(CASE WHEN COALESCE(s.ncreditnum, 0) <> 0 THEN CAST(s.NCREDITMNY AS DECIMAL(18,8)) ELSE 0 END) AS normal_credit_amount, SUM(CASE WHEN COALESCE(s.ncreditnum, 0) = 0 AND COALESCE(s.NCREDITMNY, 0) <> 0 THEN CAST(s.NCREDITMNY AS DECIMAL(18,8)) ELSE 0 END) AS abnormal_credit_amount, SUM(CASE WHEN COALESCE(s.ncreditnum, 0) <> 0 THEN CAST(s.NCREDITMNY AS DECIMAL(18,8)) ELSE 0 END) AS current_material_credit_total FROM mis_auto_sosgv s INNER JOIN CTE_Material_Mapping r ON s.cinventoryid = r.pk_source LEFT JOIN CTE_NIYZT_Inventory_Exclude ex ON s.cperiod = ex.cperiod AND s.cinventoryid = ex.cinventoryid WHERE s.PK_MARBASCLASS IS NOT NULL AND ex.cinventoryid IS NULL AND s.cperiod >= $1 AND s.cperiod <= $2 GROUP BY s.cperiod, r.code
+    ),
+    CTE_Monthly_Qty AS ( SELECT cperiod, material_code, SUM(CAST(nnum AS DECIMAL(18,8))) AS qty FROM mis_auto_ptpcr WHERE material_spec <> 'XTY99' AND cperiod >= $1 AND cperiod <= $2 GROUP BY cperiod, material_code ),
+    CTE_Cost_Periods AS (
+        SELECT DISTINCT cperiod FROM CTE_Material_Periods
+    ),
+    CTE_Cost_Materials AS (
+        SELECT DISTINCT material_code FROM CTE_Material_Periods
+    ),
+    CTE_Material_Period_Grid AS (
+        SELECT p.cperiod, m.material_code
+        FROM CTE_Cost_Periods p
+        CROSS JOIN CTE_Cost_Materials m
+    ),
+    CTE_Cumulative_Credit AS (
+        SELECT
+            mp.cperiod,
+            mp.material_code,
+            SUM(COALESCE(mc.current_material_credit_total, 0)) AS current_material_credit_total,
+            SUM(COALESCE(mc.normal_credit_amount, 0)) AS material_normal_credit_amount,
+            SUM(COALESCE(mc.normal_credit_amount, 0) + COALESCE(mc.abnormal_credit_amount, 0)) AS material_all_credit_amount
+        FROM CTE_Material_Period_Grid mp
+        LEFT JOIN CTE_Monthly_Credit mc
+            ON mp.material_code = mc.material_code
+           AND LEFT(mc.cperiod, 4) = LEFT(mp.cperiod, 4)
+           AND mc.cperiod <= mp.cperiod
+        GROUP BY mp.cperiod, mp.material_code
+    ),
+    CTE_Cumulative_Qty AS (
+        SELECT
+            mp.cperiod,
+            mp.material_code,
+            SUM(COALESCE(mq.qty, 0)) AS total_physical_qty
+        FROM CTE_Material_Period_Grid mp
+        LEFT JOIN CTE_Monthly_Qty mq
+            ON mp.material_code = mq.material_code
+           AND LEFT(mq.cperiod, 4) = LEFT(mp.cperiod, 4)
+           AND mq.cperiod <= mp.cperiod
+        GROUP BY mp.cperiod, mp.material_code
+    ),
+    CTE_YTD_Cost_Base AS (
+        SELECT cc.cperiod, cc.material_code, COALESCE(cc.current_material_credit_total, 0) AS current_material_credit_total, SUM(COALESCE(cc.material_all_credit_amount, 0)) OVER (PARTITION BY cc.cperiod) AS total_all_credit_amount, SUM(COALESCE(cc.material_normal_credit_amount, 0)) OVER (PARTITION BY cc.cperiod) AS total_normal_credit_amount, COALESCE(cq.total_physical_qty, 0) AS total_physical_qty, CASE WHEN SUM(COALESCE(cc.material_normal_credit_amount, 0)) OVER (PARTITION BY cc.cperiod) = 0 THEN 0 ELSE (SUM(COALESCE(cc.material_all_credit_amount, 0)) OVER (PARTITION BY cc.cperiod) / NULLIF(SUM(COALESCE(cc.material_normal_credit_amount, 0)) OVER (PARTITION BY cc.cperiod), 0)) END AS credit_ratio, CASE WHEN cc.material_code = 'XTY99' THEN 0 WHEN SUM(COALESCE(cc.material_normal_credit_amount, 0)) OVER (PARTITION BY cc.cperiod) = 0 THEN 0 ELSE COALESCE(cc.current_material_credit_total, 0) * (SUM(COALESCE(cc.material_all_credit_amount, 0)) OVER (PARTITION BY cc.cperiod) / NULLIF(SUM(COALESCE(cc.material_normal_credit_amount, 0)) OVER (PARTITION BY cc.cperiod), 0)) END AS calc_credit_amount FROM CTE_Cumulative_Credit cc LEFT JOIN CTE_Cumulative_Qty cq ON cc.material_code = cq.material_code AND cc.cperiod = cq.cperiod
+    ),
+    CTE_Unit_Cost_Price AS ( SELECT cperiod, material_code, calc_credit_amount AS total_credit_amount, total_physical_qty, (calc_credit_amount / NULLIF(total_physical_qty, 0)) AS unit_credit_price FROM CTE_YTD_Cost_Base ),
+    CTE_Basic_Metrics AS (
+        SELECT m.*, COALESCE(m.unit_base_price, 0) AS 单位底价, COALESCE(cost.unit_credit_price, 0) AS 发出商品贷方单价, COALESCE(cost.total_credit_amount, 0) AS 累计贷方总额, COALESCE(cost.total_physical_qty, 0) AS 累计发票总数量,
+               CASE WHEN m.row_type = '底价拆分行' THEN m.norigtaxmny WHEN m.row_type = '两票拆分行' THEN 0 WHEN m.row_type = '原始行' THEN (m.nnum * COALESCE(m.unit_base_price, 0)) ELSE 0 END AS 底价金额,
+               CASE WHEN m.row_type = '原始行' AND m.discount_type = '底价票折' THEN -COALESCE(m.norigsubmny1, 0) WHEN m.row_type = '原始行' AND m.discount_type IN ('两票制票折-底价票折', '底价票折-两票制票折') THEN -COALESCE(m.base_discount_val, 0) ELSE 0 END AS 底价折扣,
+               CASE WHEN m.row_type = '底价拆分行' THEN 0 WHEN m.row_type = '两票拆分行' THEN m.norigtaxmny WHEN m.row_type = '原始行' THEN (m.norigtaxmny - (m.nnum * COALESCE(m.unit_base_price, 0))) ELSE 0 END AS 高开金额,
+               CAST(COALESCE(m.norigmny1, 0) AS DECIMAL(18,8)) AS 无税金额合计
+        FROM CTE_Matched_Base_Price m LEFT JOIN CTE_Unit_Cost_Price cost ON m.material_code = cost.material_code AND m.cperiod = cost.cperiod
+        WHERE (m.row_type = '原始行' ) OR m.row_type <> '原始行'
+    ),
+    CTE_Advanced_Metrics AS (
+        SELECT *,  
+               CASE WHEN row_type = '原始行' THEN ROUND(底价金额 + 底价折扣, 8) ELSE 0 END AS 实际底价金额,
+               CASE WHEN row_type = '原始行' THEN ROUND((底价金额 + 底价折扣) / 1.13, 8) ELSE 0 END AS 底价收入,
+               ROUND(高开金额 / 1.13, 8) AS 高开收入,
+               CASE WHEN row_type = '原始行' AND discount_type IN ('两票制票折-底价票折', '底价票折-两票制票折') THEN -ROUND(norigsubmny1 - base_discount_val, 8) ELSE 0 END AS 高开折扣
+        FROM CTE_Basic_Metrics
+    ),
+    CTE_Advanced_Metrics_3 AS (
+        SELECT *,
+               CASE WHEN material_spec = 'XTY99' THEN 0.00000000 ELSE ROUND((高开金额 + 高开折扣) / 1.13, 8) END AS 还原高开折扣后的高开收入,
+               ROUND(norigtaxmny, 8) AS 价税合计_还原高开折扣,
+               ROUND(底价折扣 + 高开折扣, 8) AS 折扣合计,
+               CASE WHEN material_spec = 'XTY99' THEN 0.00000000 ELSE ROUND(((高开金额 + 高开折扣) / 1.13) * 1.13 * 0.87115, 8) END AS 计算两票制费用,
+               ROUND((CASE WHEN material_spec = 'XTY99' THEN 0.00000000 ELSE ROUND((高开金额 + 高开折扣) / 1.13, 8) END) + 底价收入, 8) AS 销售收入
+        FROM CTE_Advanced_Metrics
+    ),
+    CTE_ZBUST_Base AS (
+        SELECT cperiod, piaozhefangshi, CAST(COALESCE(saleamount, 0) AS DECIMAL(18,8)) AS saleamount, vdef__1, material_code, cinvoicecustcode,
+               CASE WHEN piaozhefangshi = '底价' THEN '底价票折' WHEN piaozhefangshi = '两票制' THEN '两票制票折' ELSE NULL END AS mapped_discount_type
+        FROM mis_auto_zbust
+        WHERE cperiod >= $1 AND cperiod <= $2
+    ),
+    CTE_ZBUST_Base_Grouped AS (
+        SELECT cperiod, vdef__1, material_code, cinvoicecustcode, mapped_discount_type, ROUND(SUM(COALESCE(saleamount, 0)), 8) AS saleamount
+        FROM CTE_ZBUST_Base GROUP BY cperiod, vdef__1, material_code, cinvoicecustcode, mapped_discount_type
+    ),
+    CTE_ZBUST_Match AS (
+        SELECT z.cperiod, z.vdef__1, z.material_code, z.cinvoicecustcode, z.mapped_discount_type, z.saleamount,
+               p.base_rn, p.row_type, p.discount_type, p.无税金额合计
+        FROM CTE_ZBUST_Base_Grouped z
+        INNER JOIN CTE_Advanced_Metrics_3 p ON z.cperiod = p.cperiod AND z.vdef__1 = p.vdef__1 AND z.material_code = p.material_code AND z.cinvoicecustcode = p.name_2 AND z.mapped_discount_type = p.discount_type
+    ),
+    CTE_ZBUST_Allocation_Base AS (
+        SELECT *, SUM(CASE WHEN row_type = '原始行' THEN 无税金额合计 ELSE 0 END) OVER (PARTITION BY cperiod, vdef__1, material_code, cinvoicecustcode, mapped_discount_type) AS 匹配组无税金额合计,
+               CASE WHEN row_type = '原始行' THEN ROUND(无税金额合计 / NULLIF(SUM(CASE WHEN row_type = '原始行' THEN 无税金额合计 ELSE 0 END) OVER (PARTITION BY cperiod, vdef__1, material_code, cinvoicecustcode, mapped_discount_type), 0), 8) ELSE 0.00000000 END AS 无税金额合计占比
+        FROM CTE_ZBUST_Match
+    ),
+    CTE_ZBUST_Allocation_Result AS (
+        SELECT base_rn, row_type,
+               ROUND(CASE WHEN row_type = '原始行' THEN saleamount * 无税金额合计占比 ELSE 0 END, 8) AS 跨期票折还原本期销售收入无税金额调整,
+               ROUND(CASE WHEN row_type = '原始行' AND mapped_discount_type = '底价票折' THEN saleamount * 无税金额合计占比 ELSE 0 END, 8) AS 跨期票折还原本期销售收入底价收入调整,
+               ROUND(CASE WHEN row_type = '原始行' AND mapped_discount_type = '两票制票折' THEN saleamount * 无税金额合计占比 ELSE 0 END, 8) AS 跨期票折还原本期销售收入高开收入调整
+        FROM CTE_ZBUST_Allocation_Base
+    ),
+    CTE_Advanced_With_ZBUST AS (
+        SELECT a.*,
+               COALESCE(z.跨期票折还原本期销售收入无税金额调整, 0) AS 跨期票折还原本期销售收入无税金额调整,
+               COALESCE(z.跨期票折还原本期销售收入底价收入调整, 0) AS 跨期票折还原本期销售收入底价收入调整,
+               COALESCE(z.跨期票折还原本期销售收入高开收入调整, 0) AS 跨期票折还原本期销售收入高开收入调整,
+               ROUND(COALESCE(a.无税金额合计, 0) + COALESCE(z.跨期票折还原本期销售收入无税金额调整, 0), 8) AS 无税金额总额,
+               ROUND(COALESCE(a.底价收入, 0) + COALESCE(z.跨期票折还原本期销售收入底价收入调整, 0), 8) AS 底价收入合计,
+               ROUND(COALESCE(a.还原高开折扣后的高开收入, 0) + COALESCE(z.跨期票折还原本期销售收入高开收入调整, 0), 8) AS 高开收入合计,
+               ROUND((COALESCE(a.还原高开折扣后的高开收入, 0) + COALESCE(z.跨期票折还原本期销售收入高开收入调整, 0)) * 1.13 * 0.87115, 8) AS 计算两票制费用_新,
+               ROUND((COALESCE(a.底价收入, 0) + COALESCE(z.跨期票折还原本期销售收入底价收入调整, 0)) + (COALESCE(a.还原高开折扣后的高开收入, 0) + COALESCE(z.跨期票折还原本期销售收入高开收入调整, 0)), 8) AS 销售收入_新
+        FROM CTE_Advanced_Metrics_3 a
+        LEFT JOIN CTE_ZBUST_Allocation_Result z
+            ON a.base_rn = z.base_rn AND a.row_type = z.row_type
+    ),
+    CTE_Monthly_Booked_Expense AS (
+        SELECT cperiod, COALESCE(SUM(CAST(localdebitamount AS DECIMAL(18,8))), 0) AS monthly_expense
+        FROM mis_auto_yvbre WHERE pk_accountingbook = '1001A11000000000LBJX' AND pk_accasoa = '1001A11000000000GG0I' AND docf1 = '1001A11000000004TG3Z' AND cperiod >= $1 AND cperiod <= $2 GROUP BY cperiod
+    ),
+    CTE_Period_List AS (
+        SELECT DISTINCT cperiod
+        FROM CTE_Advanced_With_ZBUST
+    ),
+    CTE_Total_Booked_Expense AS (
+        SELECT p.cperiod,
+               SUM(COALESCE(b.monthly_expense, 0)) OVER (PARTITION BY LEFT(p.cperiod, 4) ORDER BY p.cperiod) AS total_booked_expense
+        FROM CTE_Period_List p
+        LEFT JOIN CTE_Monthly_Booked_Expense b ON p.cperiod = b.cperiod
+    ),
+    CTE_Monthly_Calc_Fee AS (
+        SELECT cperiod, SUM(CASE WHEN row_type = '原始行' THEN 计算两票制费用_新 ELSE 0 END) AS monthly_calc_fee
+        FROM CTE_Advanced_With_ZBUST
+        GROUP BY cperiod
+    ),
+    CTE_Total_Calc_Fee AS (
+        SELECT cperiod,
+               SUM(monthly_calc_fee) OVER (PARTITION BY LEFT(cperiod, 4) ORDER BY cperiod) AS calc_fee_total
+        FROM CTE_Monthly_Calc_Fee
+    ),
+    
+    CTE_Allocation_Base AS (
+        SELECT m.*, 
+               CASE WHEN m.row_type = '原始行' THEN m.计算两票制费用_新 ELSE 0 END AS 分摊用_计算两票制费用,
+               -- 📌 这里的“分摊用_底价收入”本身就是(无税金额总额 - 账上两票制费用),即满足0.87115口径
+               CASE WHEN m.row_type = '原始行' THEN (COALESCE(m.无税金额总额, 0) - ROUND((COALESCE(b.total_booked_expense, 0) / NULLIF(t.calc_fee_total, 0)) * (CASE WHEN m.row_type = '原始行' THEN m.计算两票制费用_新 ELSE 0 END), 8)) ELSE 0 END AS 分摊用_底价收入, 
+               t.calc_fee_total AS 分摊用_总计算两票制费用, 
+               SUM(m.pieces) OVER(PARTITION BY m.cperiod) AS 期间总件数合计, 
+               -- 📌 修改3：将分摊用的总底价收入按年份(LEFT(m.cperiod, 4))汇总,获得一年内的累计合计作为分配的统一分母
+               SUM(CASE WHEN m.row_type = '原始行' THEN (COALESCE(m.无税金额总额, 0) - ROUND((COALESCE(b.total_booked_expense, 0) / NULLIF(t.calc_fee_total, 0)) * (CASE WHEN m.row_type = '原始行' THEN m.计算两票制费用_新 ELSE 0 END), 8)) ELSE 0 END) OVER(PARTITION BY LEFT(m.cperiod, 4)) AS 年度分摊用_总底价收入, 
+               COALESCE(b.total_booked_expense, 0) AS 账上两票制费用总额, 
+               f.total_period_freight, 
+               r.live_expense_rate, 
+               jd.period_total_tax, 
+               jd.period_total_rd
+        FROM CTE_Advanced_With_ZBUST m
+        LEFT JOIN CTE_Total_Booked_Expense b ON m.cperiod = b.cperiod
+        LEFT JOIN CTE_Total_Calc_Fee t ON m.cperiod = t.cperiod CROSS JOIN CTE_Dynamic_Rate r 
+        -- 📌 修改4：用数据的年度与最大月份所在年的汇总结果去关联(例如所有的 2025-01 到 2025-12 都匹配取出来的最大月总额)
+        LEFT JOIN CTE_Financial_Model jd ON LEFT(m.cperiod, 4) = jd.cyear 
+        LEFT JOIN CTE_Dynamic_Freight f ON m.cperiod = f.freight_period
+    ),
+    CTE_Final_Details AS (
+        SELECT *, ROUND(无税金额总额 * 1.13, 8) AS 销售金额,
+               CASE WHEN row_type = '原始行' AND material_spec <> 'XTY99' THEN ROUND(nnum * 发出商品贷方单价, 8) ELSE 0.00000000 END AS 发出商品成本,
+               ROUND((pieces / NULLIF(期间总件数合计, 0)) * total_period_freight, 8) AS 运费,
+               ROUND((账上两票制费用总额 / NULLIF(分摊用_总计算两票制费用, 0)) * 分摊用_计算两票制费用, 8) AS 账上两票制费用,
+               CASE WHEN row_type = '原始行' THEN ROUND((COALESCE(无税金额总额, 0) - COALESCE(账上两票制费用, 0)) * live_expense_rate, 8) ELSE 0.00000000 END AS 例行费用合计,
+               -- 📌 修改5：基于年度底价收入累计合计分摊年度累计的对应税金/研发费用
+               ROUND((period_total_tax / NULLIF(年度分摊用_总底价收入, 0)) * 分摊用_底价收入, 8) AS 税金及附加, 
+               ROUND((period_total_rd / NULLIF(年度分摊用_总底价收入, 0)) * 分摊用_底价收入, 8) AS 研发费用
+        FROM CTE_Allocation_Base
+    )
+SELECT
+    srcid, 
+    $3 AS jisuanqijian, cperiod, vdef__1, csaleinvoiceid1, vdef__2, vdef__3, dbilldate1, name_2, -- 📌 新增 dbilldate1 (对应 chukudanjuriqi)
+    name_5, name_6, sales_channel, saleschannelsalesman, area_class,
+    area_name2, vdef__5, '新特药' AS pinzhongleixing,
+    num, material_code, material_name, material_spec,
+    CAST(nnum AS DECIMAL(18,2)) AS zhushuliang, CAST(pieces AS DECIMAL(18,2)) AS jianshu,
+    CAST(norigtaxprice1 AS DECIMAL(18,8)) AS zhuhanshuidanjia, CAST(norigtaxnetprice AS DECIMAL(18,8)) AS zhuhanshuijingjia,
+    CAST(无税金额合计 AS DECIMAL(18,8)) AS 无税金额合计,
+    CAST(跨期票折还原本期销售收入无税金额调整 AS DECIMAL(18,8)) AS 跨期票折还原本期销售收入无税金额调整,
+    CAST(无税金额总额 AS DECIMAL(18,8)) AS 无税金额总额,
+    CAST(norigtaxmny AS DECIMAL(18,8)) AS jiashuiheji,
+    
+    CAST(CASE WHEN material_spec = 'XTY99' THEN 0.00000000 ELSE norigsubmny1 END AS DECIMAL(18,8)) AS feiyongchongdijine, 
+    CAST((COALESCE(ptpcr_norigtaxmny, 0) + COALESCE(norigsubmny1, 0)) AS DECIMAL(18,8)) AS chongdiqianjine, 
+    
+    CAST(CASE WHEN material_spec = 'XTY99' THEN 0.00000000 ELSE norigdiscount1 END AS DECIMAL(18,8)) AS zhekoue,
+    CAST(discount_type AS VARCHAR(50)) AS piaozheleixing,
+    CAST(单位底价 AS DECIMAL(18,8)) AS danweidijia, CAST(底价金额 AS DECIMAL(18,8)) AS dijiajine, CAST(底价折扣 AS DECIMAL(18,8)) AS dijiazhekou, CAST(实际底价金额 AS DECIMAL(18,8)) AS shijidijiajine, CAST(底价收入 AS DECIMAL(18,8)) AS dijiashouru,
+    CAST(跨期票折还原本期销售收入底价收入调整 AS DECIMAL(18,8)) AS 跨期票折还原本期销售收入底价收入调整,
+    CAST(底价收入合计 AS DECIMAL(18,8)) AS 底价收入合计,
+    CAST(高开金额 AS DECIMAL(18,8)) AS gaokaijine, CAST(高开收入 AS DECIMAL(18,8)) AS gaokaishouru, CAST(高开折扣 AS DECIMAL(18,8)) AS gaokaizhekou, CAST(还原高开折扣后的高开收入 AS DECIMAL(18,8)) AS huanyuangaokaizhekouhoudegaokaishouru,
+    CAST(跨期票折还原本期销售收入高开收入调整 AS DECIMAL(18,8)) AS 跨期票折还原本期销售收入高开收入调整,
+    CAST(高开收入合计 AS DECIMAL(18,8)) AS 高开收入合计,
+    CAST(价税合计_还原高开折扣 AS DECIMAL(18,8)) AS jiashuiheji_huanyuangaokaizhekou, CAST(折扣合计 AS DECIMAL(18,8)) AS zhekouheji,
+    CAST(计算两票制费用_新 AS DECIMAL(18,8)) AS jisuanliangpiaozhifeiyong,
+    CAST(账上两票制费用总额 AS DECIMAL(18,8)) AS zhangshangliangpiaozhifeiyongzonge, CAST(账上两票制费用 AS DECIMAL(18,8)) AS zhangshangliangpiaozhifeiyong,
+    CAST(销售收入_新 AS DECIMAL(18,8)) AS xiaoshoushouru,
+    CAST(销售金额 AS DECIMAL(18,8)) AS xiaoshoujine, CAST(发出商品成本 AS DECIMAL(18,8)) AS fachushangpinchengben, CAST(发出商品贷方单价 AS DECIMAL(18,8)) AS fachushangpindaifangdanjia, CAST(累计发票总数量 AS DECIMAL(18,2)) AS leijifapiaozongshuliang, CAST(累计贷方总额 AS DECIMAL(18,8)) AS leijidaifangzonge, CAST(期间总件数合计 AS DECIMAL(18,2)) AS zongjianshu, CAST(total_period_freight AS DECIMAL(18,8)) AS zongyunfei, CAST(运费 AS DECIMAL(18,8)) AS yunfei, CAST((COALESCE(发出商品成本, 0) + COALESCE(运费, 0)) AS DECIMAL(18,8)) AS zhuyingyewuchengben, CAST(例行费用合计 AS DECIMAL(18,8)) AS lixingfeiyongheji, CAST((COALESCE(账上两票制费用, 0) + COALESCE(例行费用合计, 0)) AS DECIMAL(18,8)) AS xiaoshoufeiyong, CAST(period_total_tax AS DECIMAL(18,8)) AS shuijinjifujiaheji, CAST(period_total_rd AS DECIMAL(18,8)) AS yanfafeiyongheji, CAST(税金及附加 AS DECIMAL(18,8)) AS shuijinjifujia, CAST(研发费用 AS DECIMAL(18,8)) AS yanfafeiyong,
+    CASE WHEN row_type = '原始行' THEN CAST((COALESCE(无税金额总额, 0) - (COALESCE(发出商品成本, 0) + COALESCE(运费, 0)) - (COALESCE(账上两票制费用, 0) + COALESCE(例行费用合计, 0)) - COALESCE(税金及附加, 0) - COALESCE(研发费用, 0)) AS DECIMAL(18,8)) ELSE 0 END AS lirun,
+    CASE WHEN row_type = '原始行' THEN CAST((COALESCE(销售收入_新, 0) - COALESCE(账上两票制费用, 0)) AS DECIMAL(18,8)) ELSE 0 END AS dijiashouru087115,
+    firstvbillcode AS xiaoshoudingdanhao, vsrccode1 AS chukudanhao, vbatchcode1 AS picihao
+FROM CTE_Final_Details
+    WHERE cperiod = $2;
+$SQL$,
+        v_aromw_partition_expr,
+        v_aromw_partition_expr,
+        v_aromw_partition_expr,
+        v_aromw_join_type,
+        v_aromw_on_condition,
+        v_qiivc_join_type,
+        v_qiivc_main_on_condition,
+        v_qiivc_join_type,
+        v_qiivc_sub_on_condition);
+
+        EXECUTE v_sql USING v_start_period, v_curr_period, s_cperiod;
+
+    END LOOP;
+
+    CALL "public"."Cost_Data_Cost_Sales_Specialty_N_Columns"(s_cperiod);
+
+    CALL "public"."Cost_Data_Cost_Sales_Specialty_Drugs_Sync_IAEMO"(s_cperiod);
+
+    -- ==========================================
+    -- 4. 成功返回
+    -- ==========================================
+    result := 1;
+    msg := CONCAT('执行成功！数据已全部生成。已批量重新计算 ', v_start_period, ' 至 ', s_cperiod, ' 期间数据。');
+
+
+END;
+$BODY$
+  LANGUAGE plpgsql

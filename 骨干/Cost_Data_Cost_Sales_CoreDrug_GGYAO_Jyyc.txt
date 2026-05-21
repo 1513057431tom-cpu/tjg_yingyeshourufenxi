@@ -1,0 +1,608 @@
+﻿CREATE OR REPLACE PROCEDURE "public"."Cost_Data_Cost_Sales_CoreDrug_GGYAO_Jyyc"(IN "p_target_date" varchar, INOUT "result" int4, INOUT "msg" text)
+ AS $BODY$
+DECLARE
+    v_yesterday VARCHAR(10);
+    v_cperiod VARCHAR(7);
+    v_start_date VARCHAR(10);
+    v_last_month_period VARCHAR(7);
+    v_source_count INT;
+BEGIN
+    v_yesterday := TO_CHAR(CAST(p_target_date AS DATE) - INTERVAL '1 day', 'YYYY-MM-DD');
+    v_cperiod := SUBSTRING(v_yesterday, 1, 7);
+    v_start_date := CONCAT(v_cperiod, '-01');
+    v_last_month_period := TO_CHAR(CAST(v_start_date AS DATE) - INTERVAL '1 month', 'YYYY-MM');
+
+    SELECT COUNT(*)
+    INTO v_source_count
+    FROM mis_auto_ptpcr p
+    INNER JOIN bd_material_v bm
+        ON bm.pk_material = p.cmaterialvid
+    INNER JOIN (
+        SELECT masid, cinvcode
+        FROM mis_auto_niyzt_sub_dijiamingxi
+        WHERE isVoid = 'f'
+        GROUP BY masid, cinvcode
+    ) ny_sub
+        ON bm.code = ny_sub.cinvcode
+    INNER JOIN mis_auto_niyzt ny
+        ON ny.id = ny_sub.masid
+       AND ny.status = 1
+       AND ny.isVoid = 0
+       AND LEFT(ny.cperiod, 4) = LEFT(v_cperiod, 4)
+       AND ny.cperiod >= v_cperiod
+    INNER JOIN mis_auto_rthzk_sub_duizhaomingxi rz
+        ON (
+            (rz.xiaoshoubumen = p.name_5)
+            OR (p.name_5 IS NULL AND rz.xiaoshoubumen IS NULL)
+        )
+       AND rz.kaipiaokehu = p.name_2
+       AND rz.isVoid = 'f'
+    INNER JOIN mis_auto_rthzk rz_main
+        ON rz_main.id = rz.masid
+       AND LEFT(rz_main.cperiod, 4) = LEFT(v_cperiod, 4)
+       AND rz_main.cperiod >= v_cperiod
+       AND rz_main.status = 1
+       AND rz_main.isVoid = 0
+    WHERE p.cperiod = v_cperiod
+      AND CAST(p.dbilldate AS DATE) >= CAST(v_start_date AS DATE)
+      AND CAST(p.dbilldate AS DATE) <= CAST(v_yesterday AS DATE);
+
+    IF COALESCE(v_source_count, 0) = 0 THEN
+        result := 1;
+        msg := CONCAT('未找到骨干经营预测源数据。期间：', v_cperiod, '，区间：', v_start_date, ' 至 ', v_yesterday);
+        RETURN;
+    END IF;
+
+    DELETE FROM public.mis_auto_jyycmx
+    WHERE hesuanqijian = v_cperiod
+      AND pinzhongleixing = '骨干';
+
+    INSERT INTO public.mis_auto_jyycmx (
+        srcid, hesuanqijian, chukudanjuriqi, jinshuipiaohao, csaleinvoiceid1,
+        jinshuikaipiaoriqi, shijichukuriqi, kaipiaokehu, xiaoshoubumen, xiaoshouyewuyuan,
+        xiaoshouqudao, qudaoyewuyuan, diqufenlei, shengshiqu, yetai,
+        pinzhongleixing, pingzhenghao, wuliaobianma, wuliaomingcheng, guige,
+        zhushuliang, jianshu, zhuhanshuidanjia, zhuhanshuijingjia, wushuijineheji,
+        kuaqiwushuitiaozheng, wushuijinezonge, jiashuiheji, feiyongchongdijine,
+        chongdiqianjine, zhekoue, piaozheleixing, danweidijia, dijiajine,
+        dijiazhekou, shijidijiajine, dijiashouru, kuaqidijiatiaozheng, dijiashouruheji,
+        gaokaijine, gaokaishouru, gaokaizhekou, huanyuangaokaizhekouhoudegaokaishouru,
+        kuaqigaokaitiaozheng, gaokaishouruheji, jiashuiheji_huanyuangaokaizhekou,
+        zhekouheji, jisuanliangpiaozhifeiyong, zhangshangliangpiaozhifeiyongzonge,
+        zhangshangliangpiaozhifeiyong, xiaoshoushouru, xiaoshoujine, fachushangpinchengben,
+        fachushangpindaifangdanjia, leijifapiaozongshuliang, leijidaifangzonge,
+        zongjianshu, zongyunfei, yunfei, zhuyingyewuchengben, lixingfeiyongheji,
+        xiaoshoufeiyong, shuijinjifujia, guanlifeiyong, yanfafeiyong, caiwufeiyong,
+        lirun, dijiashouru087115, tianruncpzhanbi, ncpkouchujishu, ncpjiajikouchu,
+        yucelixingfeiyonglv, yuceshuijinlv, yuceguanlilv, yuceyanfalv, yucecaiwulv,
+        create_time, istatus
+    )
+    SELECT
+        CAST(p.id AS VARCHAR) AS srcid,
+        v_cperiod AS hesuanqijian,
+        p.dbilldate AS chukudanjuriqi,
+        p.vdef__1 AS jinshuipiaohao,
+        p.cbillid AS csaleinvoiceid1,
+        p.vdef__2 AS jinshuikaipiaoriqi,
+        p.vdef__3 AS shijichukuriqi,
+        p.name_2 AS kaipiaokehu,
+        p.name_5 AS xiaoshoubumen,
+        p.name_6 AS xiaoshouyewuyuan,
+        p.sales_channel AS xiaoshouqudao,
+        p.sales_channel AS qudaoyewuyuan,
+        p.area_class AS diqufenlei,
+        rz.shengfen AS shengshiqu,
+        p.vdef__5 AS yetai,
+        '骨干' AS pinzhongleixing,
+        p.num AS pingzhenghao,
+        p.material_code AS wuliaobianma,
+        p.material_name AS wuliaomingcheng,
+        p.material_spec AS guige,
+        CAST(p.nnum AS DECIMAL(18,8)) AS zhushuliang,
+        CAST(p.nnum AS DECIMAL(18,8)) / NULLIF(
+            CAST(NULLIF(split_part(COALESCE(tb.measrate, ''), '/', 1), '') AS DECIMAL(18,8)),
+            0
+        ) AS jianshu,
+        CAST(p.norigtaxprice1 AS DECIMAL(18,8)) AS zhuhanshuidanjia,
+        CAST(p.norigtaxnetprice AS DECIMAL(18,8)) AS zhuhanshuijingjia,
+        CAST(p.norigmny1 AS DECIMAL(18,8)) AS wushuijineheji,
+        CAST(0 AS DECIMAL(18,8)) AS kuaqiwushuitiaozheng,
+        CAST(p.norigmny1 AS DECIMAL(18,8)) AS wushuijinezonge,
+        CAST(p.norigtaxmny AS DECIMAL(18,8)) AS jiashuiheji,
+        CAST(p.norigsubmny1 AS DECIMAL(18,8)) AS feiyongchongdijine,
+        CAST(
+            COALESCE(CAST(NULLIF(TRIM(p.norigtaxmny::TEXT), '') AS DECIMAL(18,8)), 0)
+            + COALESCE(CAST(NULLIF(TRIM(p.norigsubmny1::TEXT), '') AS DECIMAL(18,8)), 0)
+            AS DECIMAL(18,8)
+        ) AS chongdiqianjine,
+        CAST(p.norigdiscount1 AS DECIMAL(18,8)) AS zhekoue,
+        CAST('' AS VARCHAR) AS piaozheleixing,
+        NULL::DECIMAL(18,8) AS danweidijia,
+        NULL::DECIMAL(18,8) AS dijiajine,
+        CAST(0 AS DECIMAL(18,8)) AS dijiazhekou,
+        NULL::DECIMAL(18,8) AS shijidijiajine,
+        NULL::DECIMAL(18,8) AS dijiashouru,
+        CAST(0 AS DECIMAL(18,8)) AS kuaqidijiatiaozheng,
+        NULL::DECIMAL(18,8) AS dijiashouruheji,
+        NULL::DECIMAL(18,8) AS gaokaijine,
+        NULL::DECIMAL(18,8) AS gaokaishouru,
+        CAST(0 AS DECIMAL(18,8)) AS gaokaizhekou,
+        NULL::DECIMAL(18,8) AS huanyuangaokaizhekouhoudegaokaishouru,
+        CAST(0 AS DECIMAL(18,8)) AS kuaqigaokaitiaozheng,
+        NULL::DECIMAL(18,8) AS gaokaishouruheji,
+        CAST(p.norigtaxmny AS DECIMAL(18,8)) AS jiashuiheji_huanyuangaokaizhekou,
+        CAST(p.norigdiscount1 AS DECIMAL(18,8)) AS zhekouheji,
+        CAST(0 AS DECIMAL(18,8)) AS jisuanliangpiaozhifeiyong,
+        CAST(0 AS DECIMAL(18,8)) AS zhangshangliangpiaozhifeiyongzonge,
+        CAST(0 AS DECIMAL(18,8)) AS zhangshangliangpiaozhifeiyong,
+        CAST(p.norigmny1 AS DECIMAL(18,8)) AS xiaoshoushouru,
+        CAST(p.norigtaxmny AS DECIMAL(18,8)) AS xiaoshoujine,
+        CAST(0 AS DECIMAL(18,8)) AS fachushangpinchengben,
+        CAST(0 AS DECIMAL(18,8)) AS fachushangpindaifangdanjia,
+        CAST(0 AS DECIMAL(18,8)) AS leijifapiaozongshuliang,
+        CAST(0 AS DECIMAL(18,8)) AS leijidaifangzonge,
+        CAST(0 AS DECIMAL(18,8)) AS zongjianshu,
+        CAST(0 AS DECIMAL(18,8)) AS zongyunfei,
+        CAST(0 AS DECIMAL(18,8)) AS yunfei,
+        CAST(0 AS DECIMAL(18,8)) AS zhuyingyewuchengben,
+        CAST(0 AS DECIMAL(18,8)) AS lixingfeiyongheji,
+        CAST(0 AS DECIMAL(18,8)) AS xiaoshoufeiyong,
+        CAST(0 AS DECIMAL(18,8)) AS shuijinjifujia,
+        CAST(0 AS DECIMAL(18,8)) AS guanlifeiyong,
+        CAST(0 AS DECIMAL(18,8)) AS yanfafeiyong,
+        CAST(0 AS DECIMAL(18,8)) AS caiwufeiyong,
+        CAST(0 AS DECIMAL(18,8)) AS lirun,
+        CAST(0 AS DECIMAL(18,8)) AS dijiashouru087115,
+        CAST(0 AS DECIMAL(18,8)) AS tianruncpzhanbi,
+        CAST(0 AS DECIMAL(18,8)) AS ncpkouchujishu,
+        CAST(0 AS DECIMAL(18,8)) AS ncpjiajikouchu,
+        CAST(0 AS DECIMAL(18,8)) AS yucelixingfeiyonglv,
+        CAST(0 AS DECIMAL(18,8)) AS yuceshuijinlv,
+        CAST(0 AS DECIMAL(18,8)) AS yuceguanlilv,
+        CAST(0 AS DECIMAL(18,8)) AS yuceyanfalv,
+        CAST(0 AS DECIMAL(18,8)) AS yucecaiwulv,
+        NOW() AS create_time,
+        0 AS istatus
+    FROM mis_auto_ptpcr p
+    INNER JOIN bd_material_v bm
+        ON bm.pk_material = p.cmaterialvid
+    INNER JOIN (
+        SELECT masid, cinvcode
+        FROM mis_auto_niyzt_sub_dijiamingxi
+        WHERE isVoid = 'f'
+        GROUP BY masid, cinvcode
+    ) ny_sub
+        ON bm.code = ny_sub.cinvcode
+    INNER JOIN mis_auto_niyzt ny
+        ON ny.id = ny_sub.masid
+       AND ny.status = 1
+       AND ny.isVoid = 0
+       AND LEFT(ny.cperiod, 4) = LEFT(v_cperiod, 4)
+       AND ny.cperiod >= v_cperiod
+    INNER JOIN mis_auto_rthzk_sub_duizhaomingxi rz
+        ON (
+            (rz.xiaoshoubumen = p.name_5)
+            OR (p.name_5 IS NULL AND rz.xiaoshoubumen IS NULL)
+        )
+       AND rz.kaipiaokehu = p.name_2
+       AND rz.isVoid = 'f'
+    INNER JOIN mis_auto_rthzk rz_main
+        ON rz_main.id = rz.masid
+       AND LEFT(rz_main.cperiod, 4) = LEFT(v_cperiod, 4)
+       AND rz_main.cperiod >= v_cperiod
+       AND rz_main.status = 1
+       AND rz_main.isVoid = 0
+    LEFT JOIN mis_auto_tbdua tb
+        ON p.cmaterialvid = tb.pk_material
+    WHERE p.cperiod = v_cperiod
+      AND CAST(p.dbilldate AS DATE) >= CAST(v_start_date AS DATE)
+      AND CAST(p.dbilldate AS DATE) <= CAST(v_yesterday AS DATE)
+    GROUP BY p.id, rz.shengfen, tb.measrate;
+
+    WITH b_values AS (
+        SELECT
+            m.id,
+            CAST(COALESCE(NULLIF(TRIM(t2.danweidijia), ''), '0') AS DECIMAL(18,8)) AS danweidijia,
+            calculate_formula(t2.dijiajine, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS dijiajine,
+            calculate_formula(t2.dijiashouru, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS dijiashouru,
+            calculate_formula(t2.gaokaishouru, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS gaokaishouru
+        FROM public.mis_auto_jyycmx m
+        INNER JOIN mis_auto_goppm_sub_quyupeizhi t2
+            ON t2.quyu = m.shengshiqu
+        WHERE m.hesuanqijian = v_cperiod
+          AND m.pinzhongleixing = '骨干'
+          AND NOT (
+              LEFT(v_cperiod, 4) = '2026'
+              AND t2.quyu IS NOT NULL AND t2.quyu <> ''
+              AND t2.guige IS NOT NULL AND t2.guige <> ''
+              AND m.shengshiqu = t2.quyu
+              AND substring(m.guige from '([0-9]+支)') = t2.guige
+          )
+          AND CASE
+                  WHEN COALESCE(t2.guige, '') <> ''
+                  THEN substring(m.guige from '([0-9]+支)') = t2.guige
+                  ELSE TRUE
+              END
+    )
+    UPDATE public.mis_auto_jyycmx m
+    SET danweidijia = b_values.danweidijia,
+        dijiajine = b_values.dijiajine,
+        dijiashouru = b_values.dijiashouru,
+        gaokaishouru = b_values.gaokaishouru,
+        istatus = 1
+    FROM b_values
+    WHERE m.id = b_values.id;
+
+    WITH b2_values AS (
+        SELECT
+            m.id,
+            calculate_formula(t2.dijiajine, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS dijiajine,
+            calculate_formula(t2.dijiashouru, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS dijiashouru,
+            calculate_formula(t2.gaokaishouru, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS gaokaishouru
+        FROM public.mis_auto_jyycmx m
+        INNER JOIN mis_auto_goppm_sub_guigepeizhi t2
+            ON m.zhuhanshuidanjia = t2.zhuhanshuidanjia
+        WHERE m.hesuanqijian = v_cperiod
+          AND m.pinzhongleixing = '骨干'
+          AND COALESCE(t2.guige, '') <> ''
+          AND m.guige LIKE '%' || COALESCE(t2.guige, '@#@#@#') || '%'
+    )
+    UPDATE public.mis_auto_jyycmx m
+    SET dijiajine = b2_values.dijiajine,
+        dijiashouru = b2_values.dijiashouru,
+        gaokaishouru = b2_values.gaokaishouru,
+        istatus = 1
+    FROM b2_values
+    WHERE m.id = b2_values.id
+      AND COALESCE(m.istatus, 0) <> 1;
+
+    WITH b3_values AS (
+        SELECT
+            m.id,
+            calculate_formula(t2.dijiajine, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS dijiajine,
+            calculate_formula(t2.dijiashouru, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS dijiashouru,
+            calculate_formula(t2.gaokaishouru, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS gaokaishouru
+        FROM public.mis_auto_jyycmx m
+        INNER JOIN mis_auto_goppm_sub_bumenpeizhi t2
+            ON m.xiaoshoubumen = t2.bumen
+        WHERE m.hesuanqijian = v_cperiod
+          AND m.pinzhongleixing = '骨干'
+    )
+    UPDATE public.mis_auto_jyycmx m
+    SET dijiajine = b3_values.dijiajine,
+        dijiashouru = b3_values.dijiashouru,
+        gaokaishouru = b3_values.gaokaishouru,
+        istatus = 1
+    FROM b3_values
+    WHERE m.id = b3_values.id
+      AND COALESCE(m.istatus, 0) <> 1;
+
+    UPDATE public.mis_auto_jyycmx m
+    SET danweidijia = COALESCE(m.danweidijia, 0),
+        dijiajine = COALESCE(m.jiashuiheji, 0),
+        dijiashouru = COALESCE(m.wushuijineheji, 0),
+        gaokaishouru = 0,
+        istatus = 1
+    WHERE m.hesuanqijian = v_cperiod
+      AND m.pinzhongleixing = '骨干'
+      AND m.xiaoshoubumen IN ('供应链管理组', '供应链组', '商务组')
+      AND COALESCE(m.istatus, 0) <> 1;
+
+    WITH b4_values AS (
+        SELECT
+            m.id,
+            calculate_formula(t2.dijiajine, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS dijiajine,
+            calculate_formula(t2.dijiashouru, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS dijiashouru,
+            calculate_formula(t2.gaokaishouru, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS gaokaishouru
+        FROM public.mis_auto_jyycmx m
+        INNER JOIN mis_auto_goppm_sub_kehupeizhi t2
+            ON m.kaipiaokehu = t2.kehu
+        WHERE m.hesuanqijian = v_cperiod
+          AND m.pinzhongleixing = '骨干'
+          AND CASE WHEN COALESCE(t2.guige, '') <> '' THEN m.guige = t2.guige ELSE TRUE END
+          AND (
+              v_cperiod LIKE '2025%'
+              OR (
+                  v_cperiod >= '2026-01'
+                  AND (
+                      t2.quyu IS NULL OR t2.quyu = ''
+                      OR POSITION(CONCAT(',', m.shengshiqu, ',') IN CONCAT(',', t2.quyu, ',')) > 0
+                  )
+              )
+          )
+    )
+    UPDATE public.mis_auto_jyycmx m
+    SET dijiajine = b4_values.dijiajine,
+        dijiashouru = b4_values.dijiashouru,
+        gaokaishouru = b4_values.gaokaishouru,
+        istatus = 1
+    FROM b4_values
+    WHERE m.id = b4_values.id
+      AND COALESCE(m.istatus, 0) <> 1;
+
+    UPDATE public.mis_auto_jyycmx m
+    SET danweidijia = COALESCE(m.danweidijia, 0),
+        dijiajine = COALESCE(m.jiashuiheji, 0),
+        dijiashouru = COALESCE(m.wushuijineheji, 0),
+        gaokaishouru = 0,
+        istatus = 1
+    FROM mis_auto_ptpcr p
+    WHERE CAST(p.id AS VARCHAR) = m.srcid
+      AND m.hesuanqijian = v_cperiod
+      AND m.pinzhongleixing = '骨干'
+      AND m.kaipiaokehu = '北京九州通医药有限公司'
+      AND p.material_shortname = 'H1-12F'
+      AND p.material_spec = '10mlx12支x60盒/件'
+      AND COALESCE(m.istatus, 0) <> 1;
+
+    WITH lower_price_values AS (
+        SELECT
+            m.id,
+            calculate_formula(g.danweidijia, 'zhuhanshuijingjia,zhushuliang,jiashuiheji,wushuijineheji', CONCAT(m.zhuhanshuijingjia, ',', m.zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS danweidijia
+        FROM public.mis_auto_jyycmx m
+        INNER JOIN mis_auto_goppm_sub_zuixinguize g
+            ON m.hesuanqijian >= g.kaiqiqijian
+           AND m.hesuanqijian <= g.jieshuqijian
+           AND substring(m.guige from '([0-9]+支)') = g.guige
+        WHERE m.hesuanqijian = v_cperiod
+          AND m.pinzhongleixing = '骨干'
+          AND v_cperiod >= '2026-01'
+          AND COALESCE(m.istatus, 0) <> 1
+          AND COALESCE(m.zhuhanshuijingjia, 0) < COALESCE(calculate_formula(g.danweidijia, 'zhuhanshuijingjia,zhushuliang,jiashuiheji,wushuijineheji', CONCAT(m.zhuhanshuijingjia, ',', m.zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)), 0)
+    )
+    UPDATE public.mis_auto_jyycmx m
+    SET danweidijia = lower_price_values.danweidijia,
+        dijiajine = COALESCE(m.jiashuiheji, 0),
+        dijiashouru = COALESCE(m.wushuijineheji, 0),
+        gaokaishouru = 0,
+        istatus = 1
+    FROM lower_price_values
+    WHERE m.id = lower_price_values.id;
+
+    WITH b5_values AS (
+        SELECT *
+        FROM mis_auto_goppm_sub_zuixinguize
+    ),
+    b6_values AS (
+        SELECT
+            m.id,
+            g.guige AS gg,
+            calculate_formula(g.danweidijia, 'zhuhanshuijingjia,zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhuhanshuijingjia, ',', zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS danweidijia,
+            calculate_formula(g.dijiajine, 'zhuhanshuijingjia,zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhuhanshuijingjia, ',', zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS dijiajine,
+            calculate_formula(g.dijiashouru, 'zhuhanshuijingjia,zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhuhanshuijingjia, ',', zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS dijiashouru,
+            calculate_formula(g.gaokaishouru, 'zhuhanshuijingjia,zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhuhanshuijingjia, ',', zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS gaokaishouru,
+            substring(m.guige from '([0-9]+支)') AS main_zhishu
+        FROM public.mis_auto_jyycmx m
+        INNER JOIN b5_values g
+            ON m.hesuanqijian >= g.kaiqiqijian
+           AND m.hesuanqijian <= g.jieshuqijian
+        WHERE m.hesuanqijian = v_cperiod
+          AND m.pinzhongleixing = '骨干'
+    )
+    UPDATE public.mis_auto_jyycmx m
+    SET danweidijia = b6_values.danweidijia,
+        dijiajine = b6_values.dijiajine,
+        dijiashouru = b6_values.dijiashouru,
+        gaokaishouru = b6_values.gaokaishouru,
+        istatus = 2
+    FROM b6_values
+    WHERE m.id = b6_values.id
+      AND b6_values.gg = b6_values.main_zhishu
+      AND COALESCE(m.istatus, 0) <> 1;
+
+    WITH b_values9 AS (
+        SELECT
+            m.id,
+            CAST(COALESCE(NULLIF(TRIM(t2.danweidijia), ''), '0') AS DECIMAL(18,8)) AS danweidijia,
+            calculate_formula(t2.dijiajine, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS dijiajine,
+            calculate_formula(t2.dijiashouru, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS dijiashouru,
+            calculate_formula(t2.gaokaishouru, 'zhushuliang,jiashuiheji,wushuijineheji', CONCAT(zhushuliang, ',', m.jiashuiheji, ',', m.wushuijineheji)) AS gaokaishouru
+        FROM public.mis_auto_jyycmx m
+        INNER JOIN mis_auto_goppm_sub_wuliaopeizhi t2
+            ON t2.wuliaobianma = m.wuliaobianma
+        WHERE m.hesuanqijian = v_cperiod
+          AND m.pinzhongleixing = '骨干'
+          AND v_cperiod >= '2026-01'
+    )
+    UPDATE public.mis_auto_jyycmx m
+    SET danweidijia = b_values9.danweidijia,
+        dijiajine = b_values9.dijiajine,
+        dijiashouru = b_values9.dijiashouru,
+        gaokaishouru = b_values9.gaokaishouru,
+        istatus = 1
+    FROM b_values9
+    WHERE m.id = b_values9.id;
+
+    UPDATE public.mis_auto_jyycmx m
+    SET danweidijia = 0,
+        dijiajine = COALESCE(m.jiashuiheji, 0),
+        dijiashouru = COALESCE(m.wushuijineheji, 0),
+        gaokaishouru = 0,
+        istatus = 1
+    WHERE m.hesuanqijian = v_cperiod
+      AND m.pinzhongleixing = '骨干'
+      AND m.wuliaobianma = '2000419';
+
+    UPDATE public.mis_auto_jyycmx
+    SET danweidijia = COALESCE(danweidijia, 0),
+        dijiajine = ROUND(COALESCE(dijiajine, 0), 8),
+        shijidijiajine = ROUND(COALESCE(dijiajine, 0), 8),
+        dijiashouru = ROUND(COALESCE(dijiashouru, COALESCE(dijiajine, 0) / 1.13), 8),
+        dijiashouruheji = ROUND(COALESCE(dijiashouru, COALESCE(dijiajine, 0) / 1.13), 8),
+        gaokaijine = ROUND(COALESCE(jiashuiheji, 0) - COALESCE(dijiajine, 0), 8),
+        gaokaishouru = ROUND(COALESCE(gaokaishouru, COALESCE(wushuijineheji, 0) - COALESCE(dijiashouru, 0)), 8),
+        huanyuangaokaizhekouhoudegaokaishouru = ROUND(COALESCE(gaokaishouru, COALESCE(wushuijineheji, 0) - COALESCE(dijiashouru, 0)), 8),
+        gaokaishouruheji = ROUND(COALESCE(gaokaishouru, COALESCE(wushuijineheji, 0) - COALESCE(dijiashouru, 0)), 8),
+        jiashuiheji_huanyuangaokaizhekou = ROUND(COALESCE(jiashuiheji, 0), 8),
+        zhekouheji = ROUND(COALESCE(zhekoue, 0), 8),
+        xiaoshoushouru = ROUND(COALESCE(wushuijineheji, 0), 8),
+        xiaoshoujine = ROUND(COALESCE(jiashuiheji, 0), 8),
+        wushuijinezonge = ROUND(COALESCE(wushuijineheji, 0), 8)
+    WHERE hesuanqijian = v_cperiod
+      AND pinzhongleixing = '骨干';
+
+    UPDATE public.mis_auto_jyycmx
+    SET jisuanliangpiaozhifeiyong = ROUND(COALESCE(gaokaishouru, 0) * 1.13 * 0.87115, 8)
+    WHERE hesuanqijian = v_cperiod
+      AND pinzhongleixing = '骨干';
+
+    WITH CTE_Predict_Freight_Rate AS (
+        SELECT
+            wuliaobianma AS material_code,
+            CASE WHEN SUM(zhushuliang) > 0 THEN SUM(yunfei) / SUM(zhushuliang) ELSE 0 END AS unit_freight_rate,
+            SUM(zhushuliang) AS total_qty,
+            SUM(yunfei) AS total_freight
+        FROM mis_auto_hlutv
+        WHERE cperiod = v_last_month_period
+          AND wuliaomingcheng LIKE '%鼻窦炎%'
+        GROUP BY wuliaobianma
+    ),
+    CTE_Predict_Routine_Rate AS (
+        SELECT
+            wuliaobianma AS material_code,
+            CASE WHEN SUM(dijiashouru_087115) > 0 THEN SUM(erjizhanglixingfeiyong) / SUM(dijiashouru_087115) ELSE 0 END AS predict_erji_routine_rate
+        FROM mis_auto_hlutv
+        WHERE cperiod = v_last_month_period
+        GROUP BY wuliaobianma
+    ),
+    CTE_Predict_Nose_Routine_Rate AS (
+        SELECT
+            CASE WHEN SUM(dijiashouru_087115) > 0 THEN SUM(chuerjizhanglixingfeiyong) / SUM(dijiashouru_087115) ELSE 0 END AS predict_chuerji_routine_rate
+        FROM mis_auto_hlutv
+        WHERE cperiod = v_last_month_period
+          AND wuliaomingcheng LIKE '%鼻窦炎%'
+    ),
+    CTE_Predict_Period_Fee_Rate AS (
+        SELECT
+            CASE WHEN SUM(dijiashouru_087115) > 0 THEN SUM(guganshuijin) / SUM(dijiashouru_087115) ELSE 0 END AS predict_tax_rate,
+            CASE WHEN SUM(dijiashouru_087115) > 0 THEN SUM(guganguanli) / SUM(dijiashouru_087115) ELSE 0 END AS predict_mgmt_rate,
+            CASE WHEN SUM(dijiashouru_087115) > 0 THEN SUM(guganyanfa) / SUM(dijiashouru_087115) ELSE 0 END AS predict_rd_rate,
+            CASE WHEN SUM(dijiashouru_087115) > 0 THEN SUM(gugancaiwu) / SUM(dijiashouru_087115) ELSE 0 END AS predict_fin_rate
+        FROM mis_auto_hlutv
+        WHERE cperiod = v_last_month_period
+    ),
+    CTE_YTD_Cost_Base AS (
+        SELECT
+            t.cperiod,
+            t.wuliaobianma AS material_code,
+            CAST(COALESCE(t.jiecunshuliang, 0) AS DECIMAL(18,8)) AS total_physical_qty,
+            CAST(COALESCE(t.jiecundanjia, 0) AS DECIMAL(18,8)) AS balance_unit_price
+        FROM mis_auto_busdu t
+        WHERE COALESCE(t."isVoid"::TEXT, '0') IN ('0', 'f', 'false')
+          AND NULLIF(TRIM(COALESCE(t.cperiod, '')), '') IS NOT NULL
+          AND NULLIF(TRIM(COALESCE(t.wuliaobianma, '')), '') IS NOT NULL
+    ),
+    CTE_Last_Month_Cost AS (
+        SELECT
+            material_code,
+            CASE WHEN total_physical_qty > 0 THEN COALESCE(balance_unit_price, 0) ELSE 0 END AS last_month_unit_price
+        FROM CTE_YTD_Cost_Base
+        WHERE cperiod = v_last_month_period
+          AND total_physical_qty > 0
+    ),
+    CTE_New_Product_Cost AS (
+        SELECT
+            d.cmaterialvid AS material_key,
+            d.nabprice AS new_product_unit_price
+        FROM mis_auto_thfjq d
+        INNER JOIN (
+            SELECT cmaterialvid, MAX(id) AS max_id
+            FROM mis_auto_thfjq
+            GROUP BY cmaterialvid
+        ) latest
+            ON d.id = latest.max_id
+    ),
+    CTE_Recalc AS (
+        SELECT
+            m.id,
+            COALESCE(lm.last_month_unit_price, COALESCE(np.new_product_unit_price, 0)) AS unit_cost,
+            COALESCE(pfr.unit_freight_rate, 0) AS unit_freight_rate,
+            COALESCE(per.predict_tax_rate, 0) AS predict_tax_rate,
+            COALESCE(per.predict_mgmt_rate, 0) AS predict_mgmt_rate,
+            COALESCE(per.predict_rd_rate, 0) AS predict_rd_rate,
+            COALESCE(per.predict_fin_rate, 0) AS predict_fin_rate,
+            ROUND(COALESCE(m.wushuijineheji, 0) - COALESCE(m.jisuanliangpiaozhifeiyong, 0), 8) AS income_087115,
+            ROUND(
+                (COALESCE(m.wushuijineheji, 0) - COALESCE(m.jisuanliangpiaozhifeiyong, 0))
+                * COALESCE(prr.predict_erji_routine_rate, 0),
+                8
+            ) AS erji_routine_fee,
+            ROUND(
+                (COALESCE(m.wushuijineheji, 0) - COALESCE(m.jisuanliangpiaozhifeiyong, 0))
+                * CASE
+                      WHEN m.wuliaomingcheng LIKE '%鼻窦炎%' THEN COALESCE(pnr.predict_chuerji_routine_rate, 0)
+                      ELSE 0
+                  END,
+                8
+            ) AS chuerji_routine_fee
+        FROM public.mis_auto_jyycmx m
+        LEFT JOIN mis_auto_ptpcr p
+            ON CAST(p.id AS VARCHAR) = m.srcid
+        LEFT JOIN CTE_Last_Month_Cost lm
+            ON m.wuliaobianma = lm.material_code
+        LEFT JOIN CTE_New_Product_Cost np
+            ON p.cmaterialvid = np.material_key
+        LEFT JOIN CTE_Predict_Freight_Rate pfr
+            ON m.wuliaobianma = pfr.material_code
+        LEFT JOIN CTE_Predict_Routine_Rate prr
+            ON m.wuliaobianma = prr.material_code
+        CROSS JOIN CTE_Predict_Nose_Routine_Rate pnr
+        CROSS JOIN CTE_Predict_Period_Fee_Rate per
+        WHERE m.hesuanqijian = v_cperiod
+          AND m.pinzhongleixing = '骨干'
+    )
+    UPDATE public.mis_auto_jyycmx m
+    SET fachushangpindaifangdanjia = ROUND(r.unit_cost, 8),
+        fachushangpinchengben = ROUND(COALESCE(m.zhushuliang, 0) * r.unit_cost, 8),
+        yunfei = ROUND(
+            CASE
+                WHEN m.wuliaomingcheng LIKE '%鼻窦炎%' THEN COALESCE(m.zhushuliang, 0) * r.unit_freight_rate
+                ELSE 0
+            END,
+            8
+        ),
+        zhuyingyewuchengben = ROUND(
+            (COALESCE(m.zhushuliang, 0) * r.unit_cost)
+            + CASE
+                  WHEN m.wuliaomingcheng LIKE '%鼻窦炎%' THEN COALESCE(m.zhushuliang, 0) * r.unit_freight_rate
+                  ELSE 0
+              END,
+            8
+        ),
+        dijiashouru087115 = ROUND(r.income_087115, 8),
+        erjizhanglixingfeiyong = ROUND(r.erji_routine_fee, 8),
+        chuerjizhanglixingfeiyong = ROUND(r.chuerji_routine_fee, 8),
+        lixingfeiyongheji = ROUND(r.erji_routine_fee + r.chuerji_routine_fee, 8),
+        xiaoshoufeiyong = ROUND(COALESCE(m.jisuanliangpiaozhifeiyong, 0) + r.erji_routine_fee + r.chuerji_routine_fee, 8),
+        shuijinjifujia = ROUND(r.income_087115 * r.predict_tax_rate, 8),
+        guanlifeiyong = ROUND(r.income_087115 * r.predict_mgmt_rate, 8),
+        yanfafeiyong = ROUND(r.income_087115 * r.predict_rd_rate, 8),
+        caiwufeiyong = ROUND(r.income_087115 * r.predict_fin_rate, 8)
+    FROM CTE_Recalc r
+    WHERE m.id = r.id;
+
+    UPDATE public.mis_auto_jyycmx
+    SET lirun = ROUND(
+            COALESCE(wushuijineheji, 0)
+            - COALESCE(zhuyingyewuchengben, 0)
+            - COALESCE(xiaoshoufeiyong, 0)
+            - COALESCE(shuijinjifujia, 0)
+            - COALESCE(guanlifeiyong, 0)
+            - COALESCE(yanfafeiyong, 0)
+            - COALESCE(caiwufeiyong, 0),
+            8
+        )
+    WHERE hesuanqijian = v_cperiod
+      AND pinzhongleixing = '骨干';
+
+    result := 1;
+    msg := CONCAT('执行成功。自动测算区间：', v_start_date, ' 至 ', v_yesterday);
+
+EXCEPTION
+    WHEN OTHERS THEN
+        result := 0;
+        msg := SQLERRM;
+        RAISE NOTICE '发生错误: %', msg;
+END;
+$BODY$
+  LANGUAGE plpgsql;
